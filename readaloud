@@ -464,6 +464,7 @@ class TUI:
         self._t_width     = -1
         # Autoscroll / highlight
         self._autoscroll  = True
+        self._highlight   = True
         # Debug overlay
         self._debug       = start_debug
         self._last_key    = ""
@@ -555,7 +556,7 @@ class TUI:
     def _layout(self, H, W):
         """Return (nav_w, text_left, text_w, rp_left, rp_w, header_h, footer_h, content_h)"""
         header_h  = 3
-        footer_h  = 4
+        footer_h  = 6
         content_h = H - header_h - footer_h
         nav_w     = max(20, W // 4) if self.nav_visible else 0
         rp_w      = RP_WIDTH if self.rpanel else 0
@@ -659,13 +660,14 @@ class TUI:
         zi     = self.cfg.get("zoom", ZOOM_DEFAULT)
         albl   = self.cfg.get("align","left").capitalize()
         auto   = "AUTO↓" if self._autoscroll else "─────"
+        hl_lbl = "HL" if self._highlight else "hl"
         dbg    = " DBG" if self._debug else ""
         sub = (f"  {icon} {state.upper():<8}"
                f"  Voice:{vname:<10}"
                f"  Speed:{speed:.2f}×"
                f"  Align:{albl:<6}"
                f"  Z{zi+1}/{len(ZOOM_LEVELS)}"
-               f"  {auto}{dbg}")
+               f"  {auto}  {hl_lbl}{dbg}")
         self._sa(2, 0, sub, sc)
 
     # ── Left nav (chapters) ───────────────────────────────────────────────────
@@ -726,7 +728,7 @@ class TUI:
 
         # Highlight line from playback position
         hl = -1
-        if self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
+        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
             hl = self._char_to_line(self.player.est_char_pos, lines)
             if self._autoscroll:
                 mg = 3
@@ -844,30 +846,98 @@ class TUI:
         y = H - fh
         self._sa(y, 0, BOX["h"]*(W-1), self._cp("accent"))
 
-        # Status row
+        # ── Row y+1: status / progress (left-anchored) ───────────────────────
         if self.player.state == "error" and self.player.error_msg:
-            self._sa(y+1, 2, f"✗ {self.player.error_msg}"[:W-3],
+            self._sa(y+1, 2, f"✗ {self.player.error_msg}"[:W//2],
                      self._cp("err", bold=True))
         elif self.player.state == "loading":
             total  = max(1, self.player.total_chunks)
             done   = self.player.chunk_idx
-            bw     = min(36, W-28)
+            bw     = min(28, W//3)
             filled = int(done/total*bw)
             bar    = "█"*filled + "░"*(bw-filled)
-            self._sa(y+1, 2, f"◌ Generating  [{bar}]  {done}/{total}",
+            self._sa(y+1, 2, f"◌ [{bar}] {done}/{total}",
                      self._cp("dim", bold=True))
         else:
             total_ch = len(self.chapters)
-            bw     = min(36, W-28)
+            bw     = min(28, W//3)
             filled = int(self.ch_idx/max(1,total_ch-1)*bw)
             bar    = "█"*filled + "░"*(bw-filled)
-            self._sa(y+1, 2, f"Book  [{bar}]  {self.ch_idx+1}/{total_ch}",
+            self._sa(y+1, 2, f"Book [{bar}] {self.ch_idx+1}/{total_ch}",
                      self._cp("playing"))
 
-        k1 = " Spc:pause  Enter:play  n/p:±ch  \\:nav  v:voices  B:bookmarks  b:+bm"
-        k2 = " s:speed  a:align  t:theme  z:autoscroll  g:goto  Ctrl+scroll:zoom  ?:debug  q:quit"
-        self._sa(y+2, 0, k1[:W-1], self._cp("ftr"))
-        self._sa(y+3, 0, k2[:W-1], self._cp("ftr"))
+        # ── Bordered key reference table (center) ────────────────────────────
+        # Two columns of key:action pairs rendered inside a box
+        KEYS = [
+            ("Spc", "play/pause"),  ("Enter", "play ch"),
+            ("n/p",  "next/prev"),  ("\\",     "nav"),
+            ("v",    "voices"),     ("B",      "bookmarks"),
+            ("b",    "+bookmark"),  ("s",      "speed"),
+            ("a",    "align"),      ("t",      "theme"),
+            ("z",    "autoscroll"), ("h",      "highlight"),
+            ("g",    "goto"),       ("C+scroll","zoom"),
+        ]
+        col_w   = 18          # width of each column entry  "key  action"
+        cols    = 2
+        rows_k  = (len(KEYS) + cols - 1) // cols   # rows needed
+        box_w   = col_w * cols + 3                  # inner + borders + gap
+        box_h   = rows_k + 2                        # rows + top/bottom border
+
+        # Keep box within footer height (fh-1 rows below separator)
+        available_rows = fh - 1
+        if box_h > available_rows:
+            box_h  = available_rows
+            rows_k = box_h - 2
+
+        bx = max(W//3, (W - box_w) // 2)           # center horizontally
+        by = y + 1
+
+        # Clamp so box doesn't exceed terminal
+        if bx + box_w >= W - 14:
+            bx = max(2, W - box_w - 15)
+
+        ac = self._cp("accent")
+        nm = self._cp("normal")
+        di = self._cp("dim")
+
+        # Box border
+        self._sa(by,          bx, BOX["tl"] + BOX["h"]*(box_w-2) + BOX["tr"], ac)
+        self._sa(by+box_h-1,  bx, BOX["bl"] + BOX["h"]*(box_w-2) + BOX["br"], ac)
+        for r in range(1, box_h-1):
+            self._sa(by+r, bx,           BOX["v"], ac)
+            self._sa(by+r, bx+box_w-1,   BOX["v"], ac)
+
+        # Key pairs inside box
+        for r in range(rows_k):
+            for c in range(cols):
+                idx = r + c * rows_k
+                if idx >= len(KEYS): continue
+                k, action = KEYS[idx]
+                cx = bx + 1 + c * (col_w + 1)
+                ry = by + 1 + r
+                if ry >= by + box_h - 1: continue
+                # Render as  [key] action
+                key_lbl = f"[{k}]"
+                self._sa(ry, cx,                key_lbl,               ac | curses.A_BOLD)
+                self._sa(ry, cx+len(key_lbl)+1, action[:col_w-len(key_lbl)-2], di)
+
+        # ── Right side: [? debug] and [q quit] stacked buttons ───────────────
+        btn_w  = 11
+        rx     = W - btn_w - 2
+        if rx > bx + box_w + 1:
+            # Top button: debug (highlighted if active)
+            dbg_attr = self._cp("playing", bold=True) if self._debug else self._cp("accent", bold=True)
+            dbg_lbl  = "? debug" if not self._debug else "? DEBUG"
+            self._sa(by,          rx, BOX["tl"] + BOX["h"]*(btn_w-2) + BOX["tr"], self._cp("accent"))
+            self._sa(by+1,        rx, BOX["v"], self._cp("accent"))
+            self._sa(by+1,        rx+1, f" {dbg_lbl} ".center(btn_w-2)[:btn_w-2], dbg_attr)
+            self._sa(by+1,        rx+btn_w-1, BOX["v"], self._cp("accent"))
+            self._sa(by+2,        rx, BOX["ml"] + BOX["h"]*(btn_w-2) + BOX["mr"], self._cp("accent"))
+            # Bottom button: quit
+            self._sa(by+3,        rx, BOX["v"], self._cp("accent"))
+            self._sa(by+3,        rx+1, " q quit ".center(btn_w-2)[:btn_w-2], self._cp("err", bold=True))
+            self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
+            self._sa(by+4,        rx, BOX["bl"] + BOX["h"]*(btn_w-2) + BOX["br"], self._cp("accent"))
 
     # ── Floating prev/next ────────────────────────────────────────────────────
 
@@ -917,7 +987,7 @@ class TUI:
                            f"zoom={self.cfg.get('zoom')}  "
                            f"theme={self.cfg.get('theme')}",
             f"  Nav        : nav_vis={self.nav_visible}  rpanel={self.rpanel}  focus={self.focus}",
-            f"  Autoscroll : {self._autoscroll}",
+            f"  Autoscroll : {self._autoscroll}  Highlight: {self._highlight}",
             f"  Bookmarks  : {len(bms)} for this file",
             f"  Last key   : {self._last_key}",
             f"  Last mouse : {self._last_mouse}",
@@ -1001,6 +1071,10 @@ class TUI:
 
         if key == ord('?'):
             self._debug = not self._debug; return
+
+        # Highlight toggle
+        if key in (ord('h'), ord('H')):
+            self._highlight = not self._highlight; return
 
         if key == ord(' '):
             if self.player.state in ("playing","paused"):
