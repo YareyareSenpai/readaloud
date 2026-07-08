@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-readaloud — EPUB/TXT reader with Edge-TTS neural voices
+readaloud — EPUB/TXT reader with multi-backend neural TTS
+Backends: edge-tts (online), kokoro, piper, f5-tts (offline)
 Deps: ebooklib (pip), edge-tts (pipx), ffplay (ffmpeg)
 Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
@@ -10,6 +11,7 @@ import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
 import curses, traceback, logging
 from pathlib import Path
 from html.parser import HTMLParser
+from typing import Dict, List, Any, Optional
 
 # ─── Logging (debug file, never pollutes curses) ──────────────────────────────
 
@@ -23,28 +25,267 @@ logging.basicConfig(
 )
 log = logging.getLogger("readaloud")
 
+# ─── Config paths ─────────────────────────────────────────────────────────────
+
+CONFIG_DIR  = Path.home() / ".config" / "readaloud"
+VOICES_DIR  = CONFIG_DIR / "voices"
+MODELS_DIR  = CONFIG_DIR / "models"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+for _d in (CONFIG_DIR, VOICES_DIR, MODELS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ─── Backend system ───────────────────────────────────────────────────────────
+
+class BaseTTSBackend:
+    """Shared interface all TTS engines implement."""
+    def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        raise NotImplementedError
+
+
+class EdgeTTSBackend(BaseTTSBackend):
+    """Microsoft Edge neural TTS via pipx run edge-tts (online)."""
+    def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        try:
+            subprocess.run(
+                ["pipx", "run", "edge-tts",
+                 "--voice", voice, "--text", text, "--write-media", output_path],
+                check=True, capture_output=True, timeout=60)
+            return True
+        except Exception as e:
+            log.error("EdgeTTS error: %s", e)
+            return False
+
+
+class KokoroBackend(BaseTTSBackend):
+    """Kokoro offline TTS — fast, high-quality CPU inference."""
+    def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        # Try Python library first
+        try:
+            from kokoro import KPipeline
+            import soundfile as sf
+            lang_code = "a" if voice.startswith("am_") or voice.startswith("af_") else "b"
+            pipeline  = KPipeline(lang_code=lang_code)
+            generator = pipeline(text, voice=voice, speed=speed, split_pattern=r"\n+")
+            for _, _, audio in generator:
+                sf.write(output_path, audio, 24000)
+                return True
+            return False
+        except Exception as e:
+            log.debug("Kokoro lib error, trying CLI: %s", e)
+        # Fallback to CLI
+        try:
+            subprocess.run(
+                ["kokoro", "--voice", voice, "--text", text, "--output", output_path],
+                check=True, capture_output=True, timeout=120)
+            return True
+        except Exception as e:
+            log.error("Kokoro CLI error: %s", e)
+            return False
+
+
+class PiperBackend(BaseTTSBackend):
+    """Piper offline TTS — ultra-lightweight ONNX runtime."""
+    def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        model_path = MODELS_DIR / f"{voice}.onnx"
+        if not model_path.exists():
+            log.error("Piper model not found: %s", model_path)
+            return False
+        try:
+            proc = subprocess.Popen(
+                ["piper", "--model", str(model_path), "--output_file", output_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            proc.communicate(input=text.encode("utf-8"))
+            return proc.returncode == 0
+        except Exception as e:
+            log.error("Piper error: %s", e)
+            return False
+
+
+class F5TTSBackend(BaseTTSBackend):
+    """F5-TTS flow-matching voice cloner (slow on CPU, GPU recommended).
+    Requires: ~/.config/readaloud/voices/ref.wav (+ optional ref.txt)
+    """
+    def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        ref_audio = VOICES_DIR / "ref.wav"
+        ref_text_file = VOICES_DIR / "ref.txt"
+        if not ref_audio.exists():
+            log.error("F5-TTS: ref.wav not found at %s", ref_audio)
+            return False
+        ref_text = ""
+        if ref_text_file.exists():
+            ref_text = ref_text_file.read_text().strip()
+        out_dir = Path(output_path).parent
+        try:
+            subprocess.run(
+                ["f5-tts_infer-cli",
+                 "--ref_audio",  str(ref_audio),
+                 "--ref_text",   ref_text or "Reference voice sample.",
+                 "--gen_text",   text,
+                 "--output_dir", str(out_dir)],
+                check=True, capture_output=True, timeout=600)
+            # CLI writes out.wav — rename to expected path
+            default_out = out_dir / "out.wav"
+            if default_out.exists():
+                default_out.rename(output_path)
+                return True
+            log.error("F5-TTS: out.wav not produced")
+            return False
+        except Exception as e:
+            log.error("F5-TTS error: %s", e)
+            return False
+
+
+# ─── System scanner ───────────────────────────────────────────────────────────
+
+ENGINE_META: Dict[str, Dict[str, str]] = {
+    "edge-tts": {
+        "label": "Edge TTS",
+        "type":  "online",
+        "note":  "Microsoft neural voices (needs internet)",
+        "ext":   ".mp3",
+    },
+    "kokoro": {
+        "label": "Kokoro",
+        "type":  "offline",
+        "note":  "Fast, high-quality CPU engine",
+        "ext":   ".wav",
+    },
+    "piper": {
+        "label": "Piper",
+        "type":  "offline",
+        "note":  "Ultra-light ONNX, needs model in ~/.config/readaloud/models/",
+        "ext":   ".wav",
+    },
+    "f5-tts": {
+        "label": "F5-TTS",
+        "type":  "offline",
+        "note":  "Voice cloner — slow on CPU, needs ref.wav",
+        "ext":   ".wav",
+    },
+}
+
+
+class SystemScanner:
+    """Runs once at startup; discovers which TTS backends are usable."""
+
+    @staticmethod
+    def scan() -> Dict[str, bool]:
+        status: Dict[str, bool] = {k: False for k in ENGINE_META}
+
+        if not (shutil.which("ffmpeg") and shutil.which("ffplay")):
+            log.warning("ffmpeg/ffplay missing — no audio possible")
+            return status
+
+        # edge-tts: pipx available or direct import
+        try:
+            import edge_tts  # noqa: F401
+            status["edge-tts"] = True
+        except ImportError:
+            if shutil.which("edge-tts") or shutil.which("pipx"):
+                status["edge-tts"] = True
+
+        # kokoro
+        try:
+            import kokoro  # noqa: F401
+            status["kokoro"] = True
+        except ImportError:
+            if shutil.which("kokoro"):
+                status["kokoro"] = True
+
+        # piper
+        if shutil.which("piper"):
+            status["piper"] = True
+        else:
+            try:
+                import piper  # noqa: F401
+                status["piper"] = True
+            except ImportError:
+                pass
+
+        # f5-tts
+        if shutil.which("f5-tts_infer-cli") or shutil.which("f5-tts"):
+            status["f5-tts"] = True
+        else:
+            try:
+                import f5_tts  # noqa: F401
+                status["f5-tts"] = True
+            except ImportError:
+                pass
+
+        log.info("Scanner: %s", {k: v for k, v in status.items()})
+        return status
+
+
+class MasterPlaybackManager:
+    """Routes synthesis calls to the active backend."""
+
+    def __init__(self):
+        self.availability = SystemScanner.scan()
+        self._backends: Dict[str, BaseTTSBackend] = {
+            "edge-tts": EdgeTTSBackend(),
+            "kokoro":   KokoroBackend(),
+            "piper":    PiperBackend(),
+            "f5-tts":   F5TTSBackend(),
+        }
+
+    def available_engines(self) -> List[str]:
+        return [k for k in ENGINE_META if self.availability.get(k)]
+
+    def is_available(self, engine: str) -> bool:
+        return self.availability.get(engine, False)
+
+    def output_ext(self, engine: str) -> str:
+        return ENGINE_META.get(engine, {}).get("ext", ".mp3")
+
+    def synthesize(self, engine: str, text: str, voice: str,
+                   speed: float, dest_path: str) -> bool:
+        if not self.is_available(engine):
+            log.warning("Engine %s unavailable, falling back to edge-tts", engine)
+            engine = "edge-tts"
+        return self._backends[engine].generate_chunk(text, voice, speed, dest_path)
+
+
+# Singleton — created once at startup
+_manager: Optional[MasterPlaybackManager] = None
+
+
+def get_manager() -> MasterPlaybackManager:
+    global _manager
+    if _manager is None:
+        _manager = MasterPlaybackManager()
+    return _manager
+
+
 # ─── Dependency check ─────────────────────────────────────────────────────────
 
 def check_deps():
     missing = []
     try:
-        import ebooklib
+        import ebooklib  # noqa: F401
     except ImportError:
         missing.append("ebooklib  →  pip install --break-system-packages ebooklib")
     if not shutil.which("ffplay"):
         missing.append("ffplay    →  sudo pacman -S ffmpeg")
+    # edge-tts is the fallback — warn if neither pipx nor the module is present
     try:
         r = subprocess.run(["pipx", "run", "edge-tts", "--version"],
                            capture_output=True, timeout=30)
         if r.returncode != 0:
             missing.append("edge-tts  →  pipx install edge-tts")
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        missing.append("edge-tts  →  pipx install edge-tts  (pacman -S python-pipx)")
+        try:
+            import edge_tts  # noqa: F401
+        except ImportError:
+            missing.append("edge-tts  →  pipx install edge-tts  (pacman -S python-pipx)")
     if missing:
         print("\033[1;31m✗ Missing dependencies:\033[0m")
         for m in missing:
             print(f"  {m}")
         sys.exit(1)
+
 
 # ─── EPUB / TXT parsing ───────────────────────────────────────────────────────
 
@@ -110,9 +351,11 @@ def parse_txt(path):
         out.append((f"Part {n}", "\n".join(buf).strip()))
     return [(t, c) for t, c in out if len(c.strip()) > 80]
 
+
 # ─── Constants & config ───────────────────────────────────────────────────────
 
-VOICES = [
+# Edge-TTS voices (used only when engine == "edge-tts")
+EDGE_VOICES = [
     ("Aria",     "US", "F", "en-US-AriaNeural"),
     ("Jenny",    "US", "F", "en-US-JennyNeural"),
     ("Michelle", "US", "F", "en-US-MichelleNeural"),
@@ -127,11 +370,34 @@ VOICES = [
     ("Liam",     "CA", "M", "en-CA-LiamNeural"),
 ]
 
+# Kokoro voices (short names; full IDs passed as voice string)
+KOKORO_VOICES = [
+    ("af_heart",  "US", "F", "af_heart"),
+    ("af_bella",  "US", "F", "af_bella"),
+    ("af_nicole", "US", "F", "af_nicole"),
+    ("am_adam",   "US", "M", "am_adam"),
+    ("am_michael","US", "M", "am_michael"),
+    ("bf_emma",   "GB", "F", "bf_emma"),
+    ("bm_george", "GB", "M", "bm_george"),
+]
+
+# Piper and F5 don't have static voice lists; they use model file names / ref.wav
+ENGINE_VOICES: Dict[str, list] = {
+    "edge-tts": EDGE_VOICES,
+    "kokoro":   KOKORO_VOICES,
+    "piper":    [],   # populated at runtime from MODELS_DIR
+    "f5-tts":   [],   # single cloned voice from ref.wav
+}
+
 SPEEDS      = [0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
-ZOOM_LEVELS = [0, 2, 5, 9, 14, 20, 28]   # extra margin cols per side
+ZOOM_LEVELS = [0, 2, 5, 9, 14, 20, 28]
 ZOOM_DEFAULT = 0
 ALIGN_ORDER  = ["left", "center", "right"]
 THEME_ORDER  = ["terminal", "dark", "gruvbox", "nord", "solarized"]
+ENGINE_ORDER = list(ENGINE_META.keys())
+
+# F5-TTS animation frames (shown while generating)
+F5_ANIM = ["◐ Generating", "◓ Generating", "◑ Generating", "◒ Generating"]
 
 THEMES = {
     "terminal": {
@@ -150,6 +416,8 @@ THEMES = {
             "bm":      (curses.COLOR_BLACK,    curses.COLOR_GREEN),
             "btn":     (curses.COLOR_BLACK,    curses.COLOR_CYAN),
             "rpanel":  (curses.COLOR_WHITE,    curses.COLOR_BLUE),
+            "offline": (curses.COLOR_GREEN,   -1),
+            "online":  (curses.COLOR_CYAN,    -1),
         },
     },
     "dark": {
@@ -164,7 +432,7 @@ THEMES = {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
             "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,18),"rpanel":(16,25),
+            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
         },
     },
     "gruvbox": {
@@ -179,7 +447,7 @@ THEMES = {
             "normal":(16,17),"accent":(19,17),"sel":(17,19),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
             "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,19),"rpanel":(16,25),
+            "btn":(17,19),"rpanel":(16,25),"offline":(20,17),"online":(19,17),
         },
     },
     "nord": {
@@ -194,7 +462,7 @@ THEMES = {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
             "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,18),"rpanel":(16,25),
+            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
         },
     },
     "solarized": {
@@ -209,7 +477,7 @@ THEMES = {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
             "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,18),"rpanel":(16,25),
+            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
         },
     },
 }
@@ -217,20 +485,20 @@ THEMES = {
 PAIR_IDX = {
     "normal":1,"accent":2,"sel":3,"playing":4,"ok":5,
     "err":6,"dim":7,"hdr":8,"ftr":9,"hl":10,"bm":11,"btn":12,"rpanel":13,
+    "offline":14,"online":15,
 }
 
 BOX = {"tl":"╭","tr":"╮","bl":"╰","br":"╯","h":"─","v":"│","ml":"├","mr":"┤"}
 
 STATE_ICONS = {
     "idle":"○","loading":"◌","playing":"▶","paused":"⏸","done":"✓","error":"✗",
+    "generating":"◐",
 }
 
-# Kitty OSC font-size sequences
 _KITTY_INC   = b"\x1b]30001\x1b\\"
 _KITTY_DEC   = b"\x1b]30002\x1b\\"
 _KITTY_RESET = b"\x1b]30003\x1b\\"
 
-CONFIG_PATH = Path.home() / ".config" / "readaloud" / "config.json"
 
 def load_config():
     if CONFIG_PATH.exists():
@@ -239,9 +507,14 @@ def load_config():
         except Exception:
             pass
     return {
-        "voice_index": 0, "speed_index": 2,
-        "theme": "terminal", "align": "left",
-        "zoom": ZOOM_DEFAULT, "last_file": None, "bookmarks": {},
+        "voice_index": 0,
+        "speed_index": 2,
+        "theme": "terminal",
+        "align": "left",
+        "zoom": ZOOM_DEFAULT,
+        "last_file": None,
+        "bookmarks": {},
+        "engine": "edge-tts",
     }
 
 def save_config(cfg):
@@ -254,6 +527,41 @@ def _kitty_font(seq: bytes):
             tty.write(seq)
     except OSError:
         pass
+
+
+# ─── Voice helpers ────────────────────────────────────────────────────────────
+
+def _piper_voices() -> list:
+    """Scan MODELS_DIR for .onnx files and return as voice tuples."""
+    voices = []
+    try:
+        for f in sorted(MODELS_DIR.glob("*.onnx")):
+            name = f.stem
+            voices.append((name, "??", "?", name))
+    except Exception:
+        pass
+    return voices
+
+def get_voices_for_engine(engine: str) -> list:
+    if engine == "piper":
+        v = _piper_voices()
+        return v if v else [("(no models)", "", "", "")]
+    if engine == "f5-tts":
+        ref = VOICES_DIR / "ref.wav"
+        label = "ref.wav ✓" if ref.exists() else "ref.wav missing"
+        return [(label, "", "", "ref")]
+    return ENGINE_VOICES.get(engine, [])
+
+def current_voice_id(cfg: dict) -> str:
+    """Return the voice identifier string for the active engine."""
+    engine = cfg.get("engine", "edge-tts")
+    voices = get_voices_for_engine(engine)
+    if not voices:
+        return ""
+    idx = cfg.get("voice_index", 0)
+    idx = min(idx, len(voices) - 1)
+    return voices[idx][3]  # 4th element is the ID
+
 
 # ─── Text helpers ─────────────────────────────────────────────────────────────
 
@@ -288,6 +596,7 @@ def wrap_text(text, width, align):
         return [l.center(width) if l else "" for l in lines]
     return lines
 
+
 # ─── Player ───────────────────────────────────────────────────────────────────
 
 class Player:
@@ -307,8 +616,21 @@ class Player:
         self._pause_ts     = 0.0
         self._paused_total = 0.0
         self.on_done       = None
+        # F5-TTS animation
+        self._anim_idx     = 0
+        self._anim_ts      = 0.0
 
-    def play(self, text, voice, speed):
+    @property
+    def anim_frame(self) -> str:
+        return F5_ANIM[self._anim_idx % len(F5_ANIM)]
+
+    def _tick_anim(self):
+        now = time.time()
+        if now - self._anim_ts > 0.25:
+            self._anim_idx += 1
+            self._anim_ts = now
+
+    def play(self, text: str, voice: str, speed: float, engine: str):
         self.stop()
         self._stop_evt.clear()
         self._pause_evt.clear()
@@ -316,44 +638,42 @@ class Player:
         self.chapter_len   = len(text)
         self.est_char_pos  = 0
         self._thread = threading.Thread(
-            target=self._run, args=(text, voice, speed), daemon=True)
+            target=self._run, args=(text, voice, speed, engine), daemon=True)
         self._thread.start()
 
-    def _run(self, text, voice, speed):
-        self.state = "loading"
+    def _run(self, text: str, voice: str, speed: float, engine: str):
+        mgr = get_manager()
+        is_f5 = (engine == "f5-tts")
+        self.state = "generating" if is_f5 else "loading"
         self.error_msg = ""
         tmpdir = tempfile.mkdtemp(prefix="readaloud_")
-        log.debug("Player._run start voice=%s speed=%s len=%d", voice, speed, len(text))
+        log.debug("Player._run engine=%s voice=%s speed=%s len=%d", engine, voice, speed, len(text))
+
         chunks = split_text(text)
         self.total_chunks = len(chunks)
         audio_files = []
+        ext = mgr.output_ext(engine)
 
         for i, chunk in enumerate(chunks):
             if self._stop_evt.is_set():
                 break
             self.chunk_idx = i
-            outfile = os.path.join(tmpdir, f"chunk_{i:04d}.mp3")
-            try:
-                subprocess.run(
-                    ["pipx", "run", "edge-tts",
-                     "--voice", voice, "--text", chunk, "--write-media", outfile],
-                    check=True, capture_output=True, timeout=60)
-                audio_files.append(outfile)
-                log.debug("chunk %d/%d generated", i+1, len(chunks))
-            except subprocess.CalledProcessError as e:
+            if is_f5:
+                self._tick_anim()
+            outfile = os.path.join(tmpdir, f"chunk_{i:04d}{ext}")
+            ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
+            if not ok:
                 self.state = "error"
-                stderr = e.stderr.decode(errors="replace") if e.stderr else ""
-                if "certificate" in stderr.lower() or "SSL" in stderr:
-                    self.error_msg = "SSL error — check network/proxy"
-                else:
-                    self.error_msg = f"edge-tts: {stderr[:120]}"
-                log.error("edge-tts error: %s", self.error_msg)
+                self.error_msg = f"{engine}: synthesis failed on chunk {i+1}"
+                log.error(self.error_msg)
                 self._cleanup(tmpdir); return
-            except subprocess.TimeoutExpired:
+            if not os.path.exists(outfile):
                 self.state = "error"
-                self.error_msg = "edge-tts timed out"
-                log.error("edge-tts timed out on chunk %d", i)
+                self.error_msg = f"{engine}: no output file produced"
+                log.error(self.error_msg)
                 self._cleanup(tmpdir); return
+            audio_files.append(outfile)
+            log.debug("chunk %d/%d generated", i+1, len(chunks))
 
         if self._stop_evt.is_set() or not audio_files:
             self._cleanup(tmpdir)
@@ -364,6 +684,7 @@ class Player:
             for af in audio_files:
                 f.write(f"file '{af}'\n")
 
+        # Speed filter: edge-tts uses atempo; wav backends rely on atempo too
         tempo = speed
         chain = []
         while tempo > 2.0:
@@ -434,10 +755,10 @@ class Player:
         try: shutil.rmtree(tmpdir, ignore_errors=True)
         except: pass
 
+
 # ─── TUI ──────────────────────────────────────────────────────────────────────
 
-# Right panel modes: None = hidden, "voices", "bookmarks"
-RP_WIDTH = 26   # right panel width when visible
+RP_WIDTH = 28   # right panel width when visible (slightly wider for engine labels)
 
 class TUI:
     def __init__(self, stdscr, chapters, filename, cfg, start_debug=False):
@@ -448,32 +769,35 @@ class TUI:
         self.ch_idx       = 0
         self.ch_scroll    = 0
         self.view_scroll  = 0
-        self.focus        = "chapters"   # "chapters" | "text" | "rpanel"
+        self.focus        = "chapters"
         self.nav_visible  = True
         self.rpanel       = None         # None | "voices" | "bookmarks"
         self.rp_sel       = 0
         self.rp_scroll    = 0
+        # Voices panel has two sub-sections: engine row (0..3) and voice row
+        self._rp_section  = "engine"     # "engine" | "voice"
+        self._engine_sel  = ENGINE_ORDER.index(cfg.get("engine", "edge-tts"))
+        self._voice_sel   = cfg.get("voice_index", 0)
         self.player       = Player()
         self.player.on_done = self._on_chapter_done
         self.running      = True
         self._lock        = threading.Lock()
-        # Text cache
         self._tlines      = []
         self._t_ch        = -1
         self._t_align     = None
         self._t_width     = -1
-        # Autoscroll / highlight
         self._autoscroll  = True
         self._highlight   = True
-        # Debug overlay
         self._debug       = start_debug
         self._last_key    = ""
         self._last_mouse  = ""
-        # Bookmarks key = filename
-        self._bm_key = self.filename
+        self._bm_key      = self.filename
         self.cfg.setdefault("bookmarks", {}).setdefault(self._bm_key, [])
+        self.cfg.setdefault("engine", "edge-tts")
+        self._mgr         = get_manager()
         self._setup_colors()
-        log.info("TUI init: %s  %d chapters", self.filename, len(chapters))
+        log.info("TUI init: %s  %d chapters  engine=%s",
+                 self.filename, len(chapters), cfg.get("engine"))
 
     # ── Colors ────────────────────────────────────────────────────────────────
 
@@ -519,11 +843,12 @@ class TUI:
                 self._play()
 
     def _play(self):
-        voice = VOICES[self.cfg["voice_index"]][3]
-        speed = SPEEDS[self.cfg["speed_index"]]
+        engine = self.cfg.get("engine", "edge-tts")
+        voice  = current_voice_id(self.cfg)
+        speed  = SPEEDS[self.cfg["speed_index"]]
         _, text = self.chapters[self.ch_idx]
-        log.info("play ch=%d voice=%s speed=%s", self.ch_idx, voice, speed)
-        self.player.play(text, voice, speed)
+        log.info("play ch=%d engine=%s voice=%s speed=%s", self.ch_idx, engine, voice, speed)
+        self.player.play(text, voice, speed, engine)
 
     # ── Text helpers ──────────────────────────────────────────────────────────
 
@@ -554,7 +879,6 @@ class TUI:
     # ── Layout geometry ───────────────────────────────────────────────────────
 
     def _layout(self, H, W):
-        """Return (nav_w, text_left, text_w, rp_left, rp_w, header_h, footer_h, content_h)"""
         header_h  = 3
         footer_h  = 6
         content_h = H - header_h - footer_h
@@ -601,12 +925,10 @@ class TUI:
         self._draw_header(W)
         if self.nav_visible:
             self._draw_nav(nav_w, hh, ch)
-            # left divider
             for r in range(ch):
                 self._sa(hh+r, nav_w, BOX["v"], self._cp("accent"))
         self._draw_text(tl, tw, hh, ch)
         if self.rpanel:
-            # right divider
             for r in range(ch):
                 self._sa(hh+r, rpl-1, BOX["v"], self._cp("accent"))
             if self.rpanel == "voices":
@@ -637,6 +959,8 @@ class TUI:
         except curses.error: pass
 
         tn      = THEMES.get(self.cfg.get("theme","terminal"),{}).get("name","")
+        engine  = self.cfg.get("engine","edge-tts")
+        elabel  = ENGINE_META.get(engine,{}).get("label", engine)
         title   = f"  📖 readaloud  ─  {self.filename}"
         nav_ind = "◀▶" if self.nav_visible else "▶▶"
         rp_ind  = ("V" if self.rpanel=="voices" else
@@ -646,28 +970,37 @@ class TUI:
         self._sa(0, max(len(title)+2, W-len(right)-1), right, self._cp("hdr", bold=True))
         self._sa(1, 0, BOX["h"]*(W-1), self._cp("accent"))
 
-        # Status bar
-        vname  = VOICES[self.cfg["voice_index"]][0]
+        vname  = current_voice_id(self.cfg) or "—"
         speed  = SPEEDS[self.cfg["speed_index"]]
         state  = self.player.state
-        icon   = STATE_ICONS.get(state, "○")
-        sc     = {"playing": self._cp("playing", bold=True),
-                  "loading": self._cp("dim",     bold=True),
-                  "paused":  self._cp("accent",  bold=True),
-                  "error":   self._cp("err",     bold=True),
-                  "done":    self._cp("ok"),
-                  "idle":    self._cp("normal")}.get(state, self._cp("normal"))
-        zi     = self.cfg.get("zoom", ZOOM_DEFAULT)
-        albl   = self.cfg.get("align","left").capitalize()
-        auto   = "AUTO↓" if self._autoscroll else "─────"
-        hl_lbl = "HL" if self._highlight else "hl"
-        dbg    = " DBG" if self._debug else ""
-        sub = (f"  {icon} {state.upper():<8}"
-               f"  Voice:{vname:<10}"
+        # F5 animation
+        if state == "generating":
+            self.player._tick_anim()
+            icon = self.player.anim_frame
+        else:
+            icon = STATE_ICONS.get(state, "○")
+        sc = {"playing":    self._cp("playing", bold=True),
+              "loading":    self._cp("dim",     bold=True),
+              "generating": self._cp("dim",     bold=True),
+              "paused":     self._cp("accent",  bold=True),
+              "error":      self._cp("err",     bold=True),
+              "done":       self._cp("ok"),
+              "idle":       self._cp("normal")}.get(state, self._cp("normal"))
+        zi   = self.cfg.get("zoom", ZOOM_DEFAULT)
+        albl = self.cfg.get("align","left").capitalize()
+        auto = "AUTO↓" if self._autoscroll else "─────"
+        hl_l = "HL" if self._highlight else "hl"
+        dbg  = " DBG" if self._debug else ""
+        if state == "generating":
+            state_lbl = self.player.anim_frame
+        else:
+            state_lbl = f"{icon} {state.upper():<10}"
+        sub = (f"  {state_lbl}"
+               f"  [{elabel}] {vname:<14}"
                f"  Speed:{speed:.2f}×"
                f"  Align:{albl:<6}"
                f"  Z{zi+1}/{len(ZOOM_LEVELS)}"
-               f"  {auto}  {hl_lbl}{dbg}")
+               f"  {auto}  {hl_l}{dbg}")
         self._sa(2, 0, sub, sc)
 
     # ── Left nav (chapters) ───────────────────────────────────────────────────
@@ -695,8 +1028,10 @@ class TUI:
             disp     = title[:maxw] + "…" if len(title) > maxw else title
             bmark    = "♥" if is_bm else " "
 
-            if idx == self.ch_idx and self.player.state in ("playing","loading","paused"):
+            if idx == self.ch_idx and self.player.state in ("playing","loading","paused","generating"):
                 icon = STATE_ICONS.get(self.player.state, "▶")
+                if self.player.state == "generating":
+                    icon = "◐"
                 line = f"{bmark}{icon} {disp}"
                 attr = self._cp("playing", bold=True)
             elif idx == self.ch_idx and focused:
@@ -726,7 +1061,6 @@ class TUI:
         maxs   = max(0, len(lines) - vis)
         self.view_scroll = min(self.view_scroll, maxs)
 
-        # Highlight line from playback position
         hl = -1
         if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
             hl = self._char_to_line(self.player.est_char_pos, lines)
@@ -755,46 +1089,98 @@ class TUI:
             pct = int(self.view_scroll / max(1, maxs) * 100)
             self._sa(top+1, left+width-6, f"{pct:3d}%", self._cp("dim"))
 
-    # ── Right panel: voices ───────────────────────────────────────────────────
+    # ── Right panel: voices (engine + voice sub-sections) ────────────────────
 
     def _draw_rp_voices(self, left, width, top, height):
         focused = self.focus == "rpanel"
-        hattr   = self._cp("rpanel", bold=True)
-        # Fill background
+
+        # Background fill
         for r in range(height):
             self._sa(top+r, left, " "*width, self._cp("rpanel"))
-        label = " VOICES"
-        if focused:
-            label += " ←"
-        self._sa(top, left, label, hattr)
-        self._sa(top, left+width-3, "Esc", self._cp("dim"))
 
-        visible = height - 2
-        cur_v   = self.cfg["voice_index"]
-        # Scroll to keep rp_sel visible
-        if self.rp_sel < self.rp_scroll:
-            self.rp_scroll = self.rp_sel
-        elif self.rp_sel >= self.rp_scroll + visible:
-            self.rp_scroll = self.rp_sel - visible + 1
+        # ── Header ───────────────────────────────────────────────────────────
+        label = " ENGINES & VOICES" + (" ←" if focused else "")
+        self._sa(top,   left, label,            self._cp("rpanel", bold=True))
+        self._sa(top,   left+width-3, "Esc",   self._cp("dim"))
+        self._sa(top+1, left, BOX["h"]*width,   self._cp("accent"))
 
-        self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
+        row = 2
+        # ── Engine section ────────────────────────────────────────────────────
+        self._sa(top+row, left, " ENGINE", self._cp("accent", bold=True))
+        row += 1
+        active_engine = self.cfg.get("engine", "edge-tts")
 
-        for row in range(visible - 1):
-            idx = self.rp_scroll + row
-            y   = top + 2 + row
-            if idx >= len(VOICES): break
-            name, country, gender, _ = VOICES[idx]
-            sym  = "♀" if gender == "F" else "♂"
-            tick = "✓" if idx == cur_v else " "
-            line = f" {tick}{sym} {name:<10} {country}"
-            if idx == self.rp_sel and focused:
-                self._sa(y, left, line.ljust(width)[:width], self._cp("sel", bold=True))
-            elif idx == cur_v:
-                self._sa(y, left, line[:width], self._cp("ok", bold=True))
+        for ei, eng_id in enumerate(ENGINE_ORDER):
+            if top+row >= top+height-2: break
+            meta    = ENGINE_META[eng_id]
+            avail   = self._mgr.is_available(eng_id)
+            is_sel  = (eng_id == active_engine)
+            is_cur  = (ei == self._engine_sel)
+            tick    = "✓" if is_sel else " "
+            badge   = "○" if meta["type"] == "online" else "◉"
+            label   = meta["label"]
+            line    = f" {tick}{badge} {label:<12}"
+
+            if not avail:
+                attr = self._cp("dim")
+                line = f"  {badge} {label:<12} ✗"
+            elif is_cur and focused and self._rp_section == "engine":
+                attr = self._cp("sel", bold=True)
+            elif is_sel:
+                attr = self._cp("ok", bold=True)
+            elif meta["type"] == "online":
+                attr = self._cp("online")
             else:
-                self._sa(y, left, line[:width], self._cp("rpanel"))
+                attr = self._cp("offline")
 
-        hint = " ↑↓ Enter=pick"
+            self._sa(top+row, left, line[:width], attr)
+            row += 1
+
+        # divider between engine and voice sections
+        if top+row < top+height-2:
+            self._sa(top+row, left, BOX["h"]*width, self._cp("dim"))
+            row += 1
+
+        # ── Voice section ─────────────────────────────────────────────────────
+        if top+row < top+height-2:
+            eng_for_voices = ENGINE_ORDER[self._engine_sel] if self._engine_sel < len(ENGINE_ORDER) else active_engine
+            voices = get_voices_for_engine(eng_for_voices)
+
+            self._sa(top+row, left,
+                     f" VOICES ({eng_for_voices})"[:width],
+                     self._cp("accent", bold=True))
+            row += 1
+
+            visible_voices = height - row - 2
+            cur_vidx       = self.cfg.get("voice_index", 0)
+
+            # Scroll rp_scroll in voice sub-section
+            if self._rp_section == "voice":
+                if self._voice_sel < self.rp_scroll:
+                    self.rp_scroll = self._voice_sel
+                elif self._voice_sel >= self.rp_scroll + visible_voices:
+                    self.rp_scroll = self._voice_sel - visible_voices + 1
+            else:
+                self.rp_scroll = 0
+
+            for vr in range(visible_voices):
+                vidx = self.rp_scroll + vr
+                y    = top + row + vr
+                if y >= top+height-1 or vidx >= len(voices): break
+                vname, vcountry, vgender, _ = voices[vidx]
+                sym  = "♀" if vgender == "F" else "♂" if vgender == "M" else " "
+                tick = "✓" if (vidx == cur_vidx and eng_for_voices == active_engine) else " "
+                line = f" {tick}{sym} {vname:<14} {vcountry}"
+
+                if vidx == self._voice_sel and focused and self._rp_section == "voice":
+                    self._sa(y, left, line.ljust(width)[:width], self._cp("sel", bold=True))
+                elif vidx == cur_vidx and eng_for_voices == active_engine:
+                    self._sa(y, left, line[:width], self._cp("ok", bold=True))
+                else:
+                    self._sa(y, left, line[:width], self._cp("rpanel"))
+
+        # Hint line
+        hint = " ↑↓:nav  Tab:section  Enter:pick"
         self._sa(top+height-1, left, hint[:width], self._cp("dim"))
 
     # ── Right panel: bookmarks ────────────────────────────────────────────────
@@ -808,13 +1194,13 @@ class TUI:
         label = f" BOOKMARKS ({len(bms)})"
         if focused:
             label += " ←"
-        self._sa(top, left, label, hattr)
-        self._sa(top, left+width-3, "Esc", self._cp("dim"))
+        self._sa(top,   left, label,         hattr)
+        self._sa(top,   left+width-3, "Esc", self._cp("dim"))
         self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
 
         if not bms:
             self._sa(top+2, left+1, "No bookmarks yet.", self._cp("dim"))
-            self._sa(top+3, left+1, "Press b to add.", self._cp("dim"))
+            self._sa(top+3, left+1, "Press b to add.",   self._cp("dim"))
         else:
             visible = height - 4
             if self.rp_sel < self.rp_scroll:
@@ -846,17 +1232,17 @@ class TUI:
         y = H - fh
         self._sa(y, 0, BOX["h"]*(W-1), self._cp("accent"))
 
-        # ── Row y+1: status / progress (left-anchored) ───────────────────────
         if self.player.state == "error" and self.player.error_msg:
             self._sa(y+1, 2, f"✗ {self.player.error_msg}"[:W//2],
                      self._cp("err", bold=True))
-        elif self.player.state == "loading":
+        elif self.player.state in ("loading", "generating"):
             total  = max(1, self.player.total_chunks)
             done   = self.player.chunk_idx
             bw     = min(28, W//3)
             filled = int(done/total*bw)
             bar    = "█"*filled + "░"*(bw-filled)
-            self._sa(y+1, 2, f"◌ [{bar}] {done}/{total}",
+            lbl    = self.player.anim_frame if self.player.state == "generating" else "◌"
+            self._sa(y+1, 2, f"{lbl} [{bar}] {done}/{total}",
                      self._cp("dim", bold=True))
         else:
             total_ch = len(self.chapters)
@@ -866,8 +1252,6 @@ class TUI:
             self._sa(y+1, 2, f"Book [{bar}] {self.ch_idx+1}/{total_ch}",
                      self._cp("playing"))
 
-        # ── Bordered key reference table (center) ────────────────────────────
-        # Two columns of key:action pairs rendered inside a box
         KEYS = [
             ("Spc", "play/pause"),  ("Enter", "play ch"),
             ("n/p",  "next/prev"),  ("\\",     "nav"),
@@ -877,37 +1261,32 @@ class TUI:
             ("z",    "autoscroll"), ("h",      "highlight"),
             ("g",    "goto"),       ("C+scroll","zoom"),
         ]
-        col_w   = 18          # width of each column entry  "key  action"
+        col_w   = 18
         cols    = 2
-        rows_k  = (len(KEYS) + cols - 1) // cols   # rows needed
-        box_w   = col_w * cols + 3                  # inner + borders + gap
-        box_h   = rows_k + 2                        # rows + top/bottom border
+        rows_k  = (len(KEYS) + cols - 1) // cols
+        box_w   = col_w * cols + 3
+        box_h   = rows_k + 2
 
-        # Keep box within footer height (fh-1 rows below separator)
         available_rows = fh - 1
         if box_h > available_rows:
             box_h  = available_rows
             rows_k = box_h - 2
 
-        bx = max(W//3, (W - box_w) // 2)           # center horizontally
+        bx = max(W//3, (W - box_w) // 2)
         by = y + 1
 
-        # Clamp so box doesn't exceed terminal
         if bx + box_w >= W - 14:
             bx = max(2, W - box_w - 15)
 
         ac = self._cp("accent")
-        nm = self._cp("normal")
         di = self._cp("dim")
 
-        # Box border
         self._sa(by,          bx, BOX["tl"] + BOX["h"]*(box_w-2) + BOX["tr"], ac)
         self._sa(by+box_h-1,  bx, BOX["bl"] + BOX["h"]*(box_w-2) + BOX["br"], ac)
         for r in range(1, box_h-1):
             self._sa(by+r, bx,           BOX["v"], ac)
             self._sa(by+r, bx+box_w-1,   BOX["v"], ac)
 
-        # Key pairs inside box
         for r in range(rows_k):
             for c in range(cols):
                 idx = r + c * rows_k
@@ -916,16 +1295,13 @@ class TUI:
                 cx = bx + 1 + c * (col_w + 1)
                 ry = by + 1 + r
                 if ry >= by + box_h - 1: continue
-                # Render as  [key] action
                 key_lbl = f"[{k}]"
                 self._sa(ry, cx,                key_lbl,               ac | curses.A_BOLD)
                 self._sa(ry, cx+len(key_lbl)+1, action[:col_w-len(key_lbl)-2], di)
 
-        # ── Right side: [? debug] and [q quit] stacked buttons ───────────────
         btn_w  = 11
         rx     = W - btn_w - 2
         if rx > bx + box_w + 1:
-            # Top button: debug (highlighted if active)
             dbg_attr = self._cp("playing", bold=True) if self._debug else self._cp("accent", bold=True)
             dbg_lbl  = "? debug" if not self._debug else "? DEBUG"
             self._sa(by,          rx, BOX["tl"] + BOX["h"]*(btn_w-2) + BOX["tr"], self._cp("accent"))
@@ -933,7 +1309,6 @@ class TUI:
             self._sa(by+1,        rx+1, f" {dbg_lbl} ".center(btn_w-2)[:btn_w-2], dbg_attr)
             self._sa(by+1,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+2,        rx, BOX["ml"] + BOX["h"]*(btn_w-2) + BOX["mr"], self._cp("accent"))
-            # Bottom button: quit
             self._sa(by+3,        rx, BOX["v"], self._cp("accent"))
             self._sa(by+3,        rx+1, " q quit ".center(btn_w-2)[:btn_w-2], self._cp("err", bold=True))
             self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
@@ -959,15 +1334,13 @@ class TUI:
         p      = self.player
         bms    = self.cfg["bookmarks"].get(self._bm_key, [])
         H2, W2 = self.scr.getmaxyx()
-        dh     = 14
+        dh     = 16
         dy     = max(3, H2 - dh - 4)
-        dw     = min(72, W2 - 4)
+        dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
-        # Background fill
         for r in range(dh):
             self._sa(dy+r, dx, " "*dw, self._cp("hdr"))
-        # Border
         self._sa(dy,      dx, BOX["tl"]+BOX["h"]*(dw-2)+BOX["tr"], self._cp("playing", bold=True))
         self._sa(dy+dh-1, dx, BOX["bl"]+BOX["h"]*(dw-2)+BOX["br"], self._cp("playing", bold=True))
         for r in range(1, dh-1):
@@ -975,22 +1348,24 @@ class TUI:
             self._sa(dy+r, dx+dw-1, BOX["v"], self._cp("playing", bold=True))
         self._sa(dy, dx+2, " DEBUG  (? to close) ", self._cp("playing", bold=True))
 
+        eng_avail = {k: v for k, v in self._mgr.availability.items()}
         rows = [
             f"  File       : {self.filename}",
             f"  Chapter    : {self.ch_idx+1}/{len(self.chapters)}  scroll={self.view_scroll}",
             f"  Player     : state={p.state}  chunk={p.chunk_idx}/{p.total_chunks}",
             f"  Playback   : est_pos={p.est_char_pos}  ch_len={p.chapter_len}  cps={p._chars_per_sec:.1f}",
             f"  Paused     : total_paused={p._paused_total:.1f}s",
-            f"  Config     : voice={VOICES[self.cfg['voice_index']][0]}  "
-                           f"speed={SPEEDS[self.cfg['speed_index']]}×  "
+            f"  Engine     : {self.cfg.get('engine','edge-tts')}  voice={current_voice_id(self.cfg)}",
+            f"  Availability: {eng_avail}",
+            f"  Config     : speed={SPEEDS[self.cfg['speed_index']]}×  "
                            f"align={self.cfg.get('align')}  "
                            f"zoom={self.cfg.get('zoom')}  "
                            f"theme={self.cfg.get('theme')}",
             f"  Nav        : nav_vis={self.nav_visible}  rpanel={self.rpanel}  focus={self.focus}",
+            f"  RP section : {self._rp_section}  engine_sel={self._engine_sel}  voice_sel={self._voice_sel}",
             f"  Autoscroll : {self._autoscroll}  Highlight: {self._highlight}",
             f"  Bookmarks  : {len(bms)} for this file",
             f"  Last key   : {self._last_key}",
-            f"  Last mouse : {self._last_mouse}",
             f"  Log        : {LOG_PATH}",
         ]
         for i, row in enumerate(rows[:dh-2]):
@@ -1013,9 +1388,7 @@ class TUI:
         self._last_mouse = (f"x={mx} y={my} "
                             f"cu={bool(ctrl_scroll_up)} cd={bool(ctrl_scroll_down)} "
                             f"pu={bool(plain_up)} pd={bool(plain_down)}")
-        log.debug("mouse %s", self._last_mouse)
 
-        # Ctrl+scroll → kitty font zoom
         if ctrl_scroll_up:
             zi = self.cfg.get("zoom", ZOOM_DEFAULT)
             if zi > 0:
@@ -1033,14 +1406,13 @@ class TUI:
             _kitty_font(_KITTY_DEC)
             return
 
-        # Plain scroll → scroll the appropriate panel
         nav_w, tl, tw, rpl, rpw, hh, fh, ch = self._layout(H, W)
         if plain_up or plain_down:
             delta = -3 if plain_up else 3
-            # Which column?
             if self.rpanel and mx >= rpl:
-                bms = self.cfg["bookmarks"].get(self._bm_key, [])
-                limit = max(0, (len(VOICES) if self.rpanel=="voices" else len(bms)) - 1)
+                bms   = self.cfg["bookmarks"].get(self._bm_key, [])
+                limit = max(0, (len(get_voices_for_engine(self.cfg.get("engine","edge-tts")))
+                                if self.rpanel=="voices" else len(bms)) - 1)
                 self.rp_sel = max(0, min(limit, self.rp_sel + delta))
             elif self.nav_visible and mx < nav_w:
                 self.ch_idx = max(0, min(len(self.chapters)-1, self.ch_idx + delta))
@@ -1060,19 +1432,16 @@ class TUI:
         except Exception:
             self._last_key = str(key)
 
-        # If right panel is focused, route there first
         if self.focus == "rpanel" and self.rpanel:
             if self._handle_rp_key(key):
                 return
 
-        # Global
         if key in (ord('q'), ord('Q')):
             self.player.stop(); self.running = False; return
 
         if key == ord('?'):
             self._debug = not self._debug; return
 
-        # Highlight toggle
         if key in (ord('h'), ord('H')):
             self._highlight = not self._highlight; return
 
@@ -1087,7 +1456,6 @@ class TUI:
             self.player.stop(); self._play(); return
 
         if key == ord('\t'):
-            # Cycle focus: chapters → text → rpanel (if visible) → chapters
             order = ["chapters","text"]
             if self.rpanel: order.append("rpanel")
             cur = self.focus if self.focus in order else "chapters"
@@ -1098,16 +1466,17 @@ class TUI:
             self.nav_visible = not self.nav_visible
             self._invalidate(); return
 
-        # Toggle right panels
         if key in (ord('v'), ord('V')):
             if self.rpanel == "voices":
                 self.rpanel = None
                 self.focus  = "text"
             else:
                 self.rpanel = "voices"
-                self.rp_sel = self.cfg["voice_index"]
-                self.rp_scroll = 0
-                self.focus  = "rpanel"
+                self._rp_section = "engine"
+                self._engine_sel = ENGINE_ORDER.index(self.cfg.get("engine","edge-tts"))
+                self._voice_sel  = self.cfg.get("voice_index", 0)
+                self.rp_scroll   = 0
+                self.focus       = "rpanel"
             return
 
         if key in (ord('B'),):
@@ -1121,13 +1490,12 @@ class TUI:
                 self.focus  = "rpanel"
             return
 
-        if key == 27:   # Esc — close right panel
+        if key == 27:
             if self.rpanel:
                 self.rpanel = None
                 self.focus  = "text"
             return
 
-        # Chapter nav
         if key in (ord('n'), ord('N')):
             if self.ch_idx < len(self.chapters)-1:
                 self.player.stop()
@@ -1142,15 +1510,13 @@ class TUI:
                 self._invalidate(); self._play()
             return
 
-        # Speed
         if key in (ord('s'), ord('S')):
-            was = self.player.state in ("playing","paused","loading")
+            was = self.player.state in ("playing","paused","loading","generating")
             self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
             save_config(self.cfg)
             if was: self.player.stop(); self._play()
             return
 
-        # Bookmark add
         if key == ord('b'):
             bms = self.cfg["bookmarks"].setdefault(self._bm_key, [])
             if not any(bm["chapter"] == self.ch_idx for bm in bms):
@@ -1159,14 +1525,12 @@ class TUI:
                 log.info("bookmark added ch=%d", self.ch_idx)
             return
 
-        # Align
         if key in (ord('a'), ord('A')):
             cur = self.cfg.get("align","left")
             self.cfg["align"] = ALIGN_ORDER[(ALIGN_ORDER.index(cur)+1) % len(ALIGN_ORDER)]
             save_config(self.cfg)
             self._invalidate(); return
 
-        # Theme
         if key in (ord('t'), ord('T')):
             cur = self.cfg.get("theme","terminal")
             idx = THEME_ORDER.index(cur) if cur in THEME_ORDER else 0
@@ -1174,15 +1538,13 @@ class TUI:
             save_config(self.cfg)
             self._setup_colors(); return
 
-        # Autoscroll
         if key in (ord('z'), ord('Z')):
             self._autoscroll = not self._autoscroll; return
 
-        # Goto
         if key in (ord('g'), ord('G')):
             self._goto_chapter(); return
 
-        # Arrow keys — route by focus
+        # Arrow keys
         if self.focus == "chapters":
             if key == curses.KEY_UP and self.ch_idx > 0:
                 self.ch_idx -= 1; self._invalidate()
@@ -1190,7 +1552,7 @@ class TUI:
                 self.ch_idx += 1; self._invalidate()
         elif self.focus == "rpanel" and self.rpanel:
             self._handle_rp_key(key)
-        else:   # text
+        else:
             H, W = self.scr.getmaxyx()
             _, tl, tw, _, _, _, _, _ = self._layout(H, W)
             zm  = ZOOM_LEVELS[self.cfg.get("zoom", ZOOM_DEFAULT)]
@@ -1206,23 +1568,59 @@ class TUI:
             elif key == curses.KEY_NPAGE:
                 self.view_scroll = min(maxs, self.view_scroll+20)
 
-    def _handle_rp_key(self, key):
+    def _handle_rp_key(self, key) -> bool:
         """Handle key when right panel is focused. Returns True if consumed."""
-        if key == 27 or key == ord('q'):
+        if key == 27:
             self.rpanel = None; self.focus = "text"; return True
 
         if self.rpanel == "voices":
-            if key == curses.KEY_UP:
-                self.rp_sel = max(0, self.rp_sel-1); return True
-            if key == curses.KEY_DOWN:
-                self.rp_sel = min(len(VOICES)-1, self.rp_sel+1); return True
-            if key in (curses.KEY_ENTER, 10, 13):
-                was = self.player.state in ("playing","paused","loading")
-                self.cfg["voice_index"] = self.rp_sel
-                save_config(self.cfg)
-                log.info("voice changed to %s", VOICES[self.rp_sel][0])
-                if was: self.player.stop(); self._play()
-                return True
+            num_engines = len(ENGINE_ORDER)
+
+            if self._rp_section == "engine":
+                if key == curses.KEY_UP:
+                    self._engine_sel = max(0, self._engine_sel - 1); return True
+                if key == curses.KEY_DOWN:
+                    self._engine_sel = min(num_engines-1, self._engine_sel + 1); return True
+                if key == ord('\t') or key == curses.KEY_RIGHT:
+                    # Switch to voice sub-section
+                    self._rp_section = "voice"
+                    self._voice_sel  = self.cfg.get("voice_index", 0)
+                    self.rp_scroll   = 0
+                    return True
+                if key in (curses.KEY_ENTER, 10, 13):
+                    # Select engine
+                    eng = ENGINE_ORDER[self._engine_sel]
+                    if self._mgr.is_available(eng):
+                        was = self.player.state in ("playing","paused","loading","generating")
+                        self.cfg["engine"]      = eng
+                        self.cfg["voice_index"] = 0
+                        self._voice_sel         = 0
+                        self.rp_scroll          = 0
+                        save_config(self.cfg)
+                        log.info("engine changed to %s", eng)
+                        if was: self.player.stop(); self._play()
+                    return True
+
+            elif self._rp_section == "voice":
+                eng_for_voices = ENGINE_ORDER[self._engine_sel]
+                voices         = get_voices_for_engine(eng_for_voices)
+                if key == curses.KEY_UP:
+                    self._voice_sel = max(0, self._voice_sel - 1); return True
+                if key == curses.KEY_DOWN:
+                    self._voice_sel = min(max(0,len(voices)-1), self._voice_sel + 1); return True
+                if key == ord('\t') or key == curses.KEY_LEFT:
+                    # Switch back to engine section
+                    self._rp_section = "engine"; return True
+                if key in (curses.KEY_ENTER, 10, 13):
+                    if voices and self._voice_sel < len(voices) and voices[0][3] != "":
+                        was = self.player.state in ("playing","paused","loading","generating")
+                        self.cfg["engine"]      = eng_for_voices
+                        self.cfg["voice_index"] = self._voice_sel
+                        save_config(self.cfg)
+                        log.info("voice changed: engine=%s voice=%s",
+                                 eng_for_voices, voices[self._voice_sel][0])
+                        if was: self.player.stop(); self._play()
+                    return True
 
         elif self.rpanel == "bookmarks":
             bms = self.cfg["bookmarks"].get(self._bm_key, [])
@@ -1277,6 +1675,7 @@ class TUI:
                     self._invalidate(); self._play()
             except ValueError:
                 pass
+
 
 # ─── File picker ─────────────────────────────────────────────────────────────
 
@@ -1337,11 +1736,22 @@ def pick_file(stdscr):
             if is_dir: cwd=path; elist=entries(cwd); sel=scroll=0
             else: return str(path)
 
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     check_deps()
     cfg = load_config()
+
+    # Initialise the backend manager early so scan happens before curses starts
+    mgr = get_manager()
+    log.info("Available engines: %s", mgr.available_engines())
+
+    # Ensure configured engine is actually available; fall back to edge-tts
+    if not mgr.is_available(cfg.get("engine", "edge-tts")):
+        available = mgr.available_engines()
+        cfg["engine"] = available[0] if available else "edge-tts"
+        log.warning("Configured engine unavailable, using: %s", cfg["engine"])
 
     start_debug = "--debug" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
