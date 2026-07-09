@@ -8,17 +8,46 @@ version = "1.0.0"
 description = "EPUB/TXT reader with multi-backend neural TTS"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "Environment :: Console :: Curses",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "License :: OSI Approved :: MIT License",
 ]
+
+# Core — always required
 dependencies = [
     "ebooklib>=0.18",
     "edge-tts>=6.0.0",
-    "pykokoro>=0.1.0",
+    "soundfile>=0.12.0",
+]
+
+# Optional engine extras — install what you need:
+#   pipx install "readaloud[kokoro]"
+#   pipx install "readaloud[piper]"
+#   pipx install "readaloud[f5]"
+#   pipx install "readaloud[all]"
+[project.optional-dependencies]
+kokoro = [
+    "kokoro>=0.9.4",
     "onnxruntime>=1.16.0",
+]
+piper = [
+    "piper-tts>=1.2.0",
+]
+f5 = [
+    "f5-tts>=1.0.0",
+]
+all = [
+    "kokoro>=0.9.4",
+    "onnxruntime>=1.16.0",
+    "piper-tts>=1.2.0",
+    "f5-tts>=1.0.0",
 ]
 
 [project.scripts]
 readaloud = "readaloud:main"
+
+[tool.setuptools]
+py-modules = ["readaloud"]
