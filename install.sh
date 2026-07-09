@@ -4,6 +4,9 @@
 # and drops a launcher at ~/.local/bin/readaloud
 set -euo pipefail
 
+# Resolve the directory this script lives in — so it can be invoked from anywhere
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 BOLD='\033[1m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -135,7 +138,7 @@ fi
 
 # ── Deploy application ────────────────────────────────────────────────────────
 step "Deploying readaloud"
-cp readaloud.py "$APP_DIR/readaloud.py"
+cp "$SCRIPT_DIR/readaloud.py" "$APP_DIR/readaloud.py"
 chmod +x "$APP_DIR/readaloud.py"
 
 cat << 'EOF' > "$BIN_DIR/readaloud"
