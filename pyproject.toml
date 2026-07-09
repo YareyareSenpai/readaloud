@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "readaloud"
+version = "1.0.0"
+description = "EPUB/TXT reader with multi-backend neural TTS"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: Console :: Curses",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "ebooklib>=0.18",
+    "edge-tts>=6.0.0",
+    "pykokoro>=0.1.0",
+    "onnxruntime>=1.16.0",
+]
+
+[project.scripts]
+readaloud = "readaloud:main"

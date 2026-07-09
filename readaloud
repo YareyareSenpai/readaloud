@@ -261,29 +261,115 @@ def get_manager() -> MasterPlaybackManager:
 
 # ─── Dependency check ─────────────────────────────────────────────────────────
 
-def check_deps():
+def _collect_missing_deps() -> list:
+    """Return a list of (label, install_cmd) tuples for missing hard deps."""
     missing = []
     try:
         import ebooklib  # noqa: F401
     except ImportError:
-        missing.append("ebooklib  →  pip install --break-system-packages ebooklib")
+        missing.append(("ebooklib", "pip install --break-system-packages ebooklib"))
     if not shutil.which("ffplay"):
-        missing.append("ffplay    →  sudo pacman -S ffmpeg")
-    # edge-tts is the fallback — warn if neither pipx nor the module is present
+        missing.append(("ffplay (ffmpeg)", "sudo pacman -S ffmpeg   # or apt/dnf equivalent"))
+    # edge-tts: required as the online fallback
     try:
         r = subprocess.run(["pipx", "run", "edge-tts", "--version"],
-                           capture_output=True, timeout=30)
+                           capture_output=True, timeout=15)
         if r.returncode != 0:
-            missing.append("edge-tts  →  pipx install edge-tts")
+            missing.append(("edge-tts", "pipx install edge-tts"))
     except (FileNotFoundError, subprocess.TimeoutExpired):
         try:
             import edge_tts  # noqa: F401
         except ImportError:
-            missing.append("edge-tts  →  pipx install edge-tts  (pacman -S python-pipx)")
+            missing.append(("edge-tts", "pipx install edge-tts   (pacman -S python-pipx)"))
+    return missing
+
+
+def _show_missing_deps_screen(stdscr, missing: list):
+    """Full-screen curses overlay listing missing deps; press q or Enter to abort."""
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_WHITE,  -1)
+    curses.init_pair(2, curses.COLOR_CYAN,   -1)
+    curses.init_pair(3, curses.COLOR_RED,    -1)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    curses.init_pair(5, curses.COLOR_GREEN,  -1)
+    stdscr.timeout(100)
+
+    BOX_H = {"tl":"╭","tr":"╮","bl":"╰","br":"╯","h":"─","v":"│"}
+
+    while True:
+        stdscr.erase()
+        H, W = stdscr.getmaxyx()
+
+        # Header bar
+        try:
+            stdscr.addstr(0, 0, " " * (W - 1),
+                          curses.color_pair(3) | curses.A_BOLD)
+            stdscr.addstr(0, 0, "  ✗  readaloud — missing dependencies",
+                          curses.color_pair(3) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        stdscr.addstr(1, 0, "─" * (W - 1), curses.color_pair(2))
+
+        y = 3
+        stdscr.addstr(y, 2,
+            "The following required packages or binaries were not found:",
+            curses.color_pair(1) | curses.A_BOLD)
+        y += 2
+
+        for label, cmd in missing:
+            if y >= H - 6:
+                break
+            stdscr.addstr(y,     4, f"✗  {label}",
+                          curses.color_pair(3) | curses.A_BOLD)
+            stdscr.addstr(y + 1, 6, f"→  {cmd}",
+                          curses.color_pair(4))
+            y += 3
+
+        # Box with instructions
+        bw = min(W - 4, 64)
+        bx = (W - bw) // 2
+        by = H - 7
+        if by > y + 1 and bw > 20:
+            try:
+                stdscr.addstr(by,     bx, BOX_H["tl"] + BOX_H["h"] * (bw - 2) + BOX_H["tr"],
+                              curses.color_pair(2))
+                stdscr.addstr(by + 1, bx, BOX_H["v"],  curses.color_pair(2))
+                stdscr.addstr(by + 1, bx + 1,
+                    " Install the packages above, then re-run readaloud.".center(bw - 2)[:bw - 2],
+                    curses.color_pair(5) | curses.A_BOLD)
+                stdscr.addstr(by + 1, bx + bw - 1, BOX_H["v"], curses.color_pair(2))
+                stdscr.addstr(by + 2, bx, BOX_H["v"],  curses.color_pair(2))
+                stdscr.addstr(by + 2, bx + 1,
+                    " Debug log: ~/.config/readaloud/debug.log".center(bw - 2)[:bw - 2],
+                    curses.color_pair(1))
+                stdscr.addstr(by + 2, bx + bw - 1, BOX_H["v"], curses.color_pair(2))
+                stdscr.addstr(by + 3, bx, BOX_H["bl"] + BOX_H["h"] * (bw - 2) + BOX_H["br"],
+                              curses.color_pair(2))
+            except curses.error:
+                pass
+
+        stdscr.addstr(H - 2, 2, "  Press q or Enter to exit",
+                      curses.color_pair(1))
+        stdscr.refresh()
+
+        k = stdscr.getch()
+        if k in (ord('q'), ord('Q'), curses.KEY_ENTER, 10, 13, 27):
+            break
+
+
+def check_deps():
+    missing = _collect_missing_deps()
     if missing:
-        print("\033[1;31m✗ Missing dependencies:\033[0m")
-        for m in missing:
-            print(f"  {m}")
+        # Try to show curses overlay; fall back to plain stderr if terminal isn't ready
+        try:
+            curses.wrapper(_show_missing_deps_screen, missing)
+        except Exception:
+            sys.stderr.write("\n✗ Missing dependencies:\n")
+            for label, cmd in missing:
+                sys.stderr.write(f"  {label}  →  {cmd}\n")
         sys.exit(1)
 
 
@@ -413,9 +499,9 @@ THEMES = {
             "hdr":     (curses.COLOR_WHITE,    curses.COLOR_BLUE),
             "ftr":     (curses.COLOR_BLACK,    curses.COLOR_WHITE),
             "hl":      (curses.COLOR_BLACK,    curses.COLOR_YELLOW),
-            "bm":      (curses.COLOR_BLACK,    curses.COLOR_GREEN),
+            "bm":      (curses.COLOR_GREEN,   -1),
             "btn":     (curses.COLOR_BLACK,    curses.COLOR_CYAN),
-            "rpanel":  (curses.COLOR_WHITE,    curses.COLOR_BLUE),
+            "rpanel":  (curses.COLOR_WHITE,   -1),   # transparent bg — blends with terminal
             "offline": (curses.COLOR_GREEN,   -1),
             "online":  (curses.COLOR_CYAN,    -1),
         },
@@ -426,13 +512,14 @@ THEMES = {
             "bg":(80,90,120),"fg":(900,910,940),"accent":(400,780,980),
             "yellow":(980,800,200),"green":(300,860,500),"red":(980,350,350),
             "dim":(650,550,800),"hdr_bg":(50,60,90),"hl_bg":(800,700,100),
-            "rp_bg":(60,70,100),
+            # rp_bg matches bg exactly — no distinct panel colour
+            "rp_bg":(80,90,120),
         },
         "pairs": {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
+            "btn":(17,18),"rpanel":(16,17),"offline":(20,17),"online":(18,17),
         },
     },
     "gruvbox": {
@@ -441,13 +528,13 @@ THEMES = {
             "bg":(156,141,100),"fg":(980,920,760),"accent":(980,740,180),
             "yellow":(980,740,180),"green":(690,730,200),"red":(980,360,220),
             "dim":(800,550,380),"hdr_bg":(120,110,80),"hl_bg":(980,740,180),
-            "rp_bg":(130,120,90),
+            "rp_bg":(156,141,100),
         },
         "pairs": {
             "normal":(16,17),"accent":(19,17),"sel":(17,19),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,19),"rpanel":(16,25),"offline":(20,17),"online":(19,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
+            "btn":(17,19),"rpanel":(16,17),"offline":(20,17),"online":(19,17),
         },
     },
     "nord": {
@@ -456,13 +543,13 @@ THEMES = {
             "bg":(184,204,239),"fg":(840,870,910),"accent":(530,750,870),
             "yellow":(920,796,545),"green":(638,745,549),"red":(749,380,416),
             "dim":(700,600,780),"hdr_bg":(149,168,203),"hl_bg":(920,796,545),
-            "rp_bg":(160,180,215),
+            "rp_bg":(184,204,239),
         },
         "pairs": {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
+            "btn":(17,18),"rpanel":(16,17),"offline":(20,17),"online":(18,17),
         },
     },
     "solarized": {
@@ -471,13 +558,13 @@ THEMES = {
             "bg":(0,168,211),"fg":(513,580,588),"accent":(149,545,823),
             "yellow":(709,537,0),"green":(521,600,0),"red":(862,196,184),
             "dim":(423,443,768),"hdr_bg":(0,121,168),"hl_bg":(709,537,0),
-            "rp_bg":(0,100,140),
+            "rp_bg":(0,168,211),
         },
         "pairs": {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
-            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
+            "btn":(17,18),"rpanel":(16,17),"offline":(20,17),"online":(18,17),
         },
     },
 }
@@ -1094,10 +1181,6 @@ class TUI:
     def _draw_rp_voices(self, left, width, top, height):
         focused = self.focus == "rpanel"
 
-        # Background fill
-        for r in range(height):
-            self._sa(top+r, left, " "*width, self._cp("rpanel"))
-
         # ── Header ───────────────────────────────────────────────────────────
         label = " ENGINES & VOICES" + (" ←" if focused else "")
         self._sa(top,   left, label,            self._cp("rpanel", bold=True))
@@ -1189,8 +1272,6 @@ class TUI:
         focused = self.focus == "rpanel"
         hattr   = self._cp("rpanel", bold=True)
         bms     = self.cfg["bookmarks"].get(self._bm_key, [])
-        for r in range(height):
-            self._sa(top+r, left, " "*width, self._cp("rpanel"))
         label = f" BOOKMARKS ({len(bms)})"
         if focused:
             label += " ←"

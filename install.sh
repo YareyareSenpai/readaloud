@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# readaloud installer
-# Detects distro, installs deps, copies script to ~/.local/bin
-
+# readaloud — High-Fidelity Isolated Application Installer
 set -euo pipefail
 
 BOLD='\033[1m'
@@ -10,73 +8,52 @@ YELLOW='\033[0;33m'
 RED='\033[0;31m'
 RESET='\033[0m'
 
-info()  { echo -e "${GREEN}✓${RESET} $*"; }
-warn()  { echo -e "${YELLOW}!${RESET} $*"; }
-error() { echo -e "${RED}✗${RESET} $*"; exit 1; }
-step()  { echo -e "\n${BOLD}$*${RESET}"; }
+info() { echo -e " ${GREEN}✓${RESET} $1"; }
+warn() { echo -e " ${YELLOW}!${RESET} $1"; }
+error() { echo -e " ${RED}✗${RESET} $1"; exit 1; }
+step() { echo -e "\n${BOLD}>>> $1${RESET}"; }
 
-step "readaloud installer"
-
-# ── Detect distro ────────────────────────────────────────────────────────────
-if command -v pacman &>/dev/null; then
-    DISTRO="arch"
-elif command -v apt &>/dev/null; then
-    DISTRO="debian"
-elif command -v dnf &>/dev/null; then
-    DISTRO="fedora"
+step "Detecting Operating System Environment"
+if command -v pacman &>/dev/null; then DISTRO="arch"
+elif command -v apt &>/dev/null; then DISTRO="debian"
+elif command -v dnf &>/dev/null; then DISTRO="fedora"
 else
-    warn "Unknown distro — skipping system package install."
-    warn "Please ensure ffmpeg and pipx are installed manually."
+    warn "Unknown distribution. Ensure ffmpeg is installed manually."
     DISTRO="unknown"
 fi
 
-# ── System packages ───────────────────────────────────────────────────────────
-step "Installing system dependencies..."
+step "Installing Host Base Dependencies"
 case "$DISTRO" in
-    arch)
-        sudo pacman -S --needed --noconfirm python-pipx ffmpeg
-        ;;
-    debian)
-        sudo apt-get update -qq
-        sudo apt-get install -y python3-pip pipx ffmpeg
-        ;;
-    fedora)
-        sudo dnf install -y pipx ffmpeg
-        ;;
+    arch) sudo pacman -S --needed --noconfirm ffmpeg python ;;
+    debian) sudo apt-get update -qq && sudo apt-get install -y ffmpeg python3-venv python3-pip ;;
+    fedora) sudo dnf install -y ffmpeg python3 ;;
 esac
 
-# ── Python packages ───────────────────────────────────────────────────────────
-step "Installing Python dependencies..."
-if python3 -c "import ebooklib" 2>/dev/null; then
-    info "ebooklib already installed"
-else
-    pip install --break-system-packages ebooklib
-    info "ebooklib installed"
-fi
+APP_DIR="$HOME/.local/share/readaloud"
+BIN_DIR="$HOME/.local/bin"
+VENV_DIR="$APP_DIR/venv"
 
-# ── edge-tts (pipx run — no explicit install needed) ─────────────────────────
-step "Checking edge-tts..."
-if pipx run edge-tts --version &>/dev/null; then
-    info "edge-tts available via pipx"
-else
-    warn "pipx run edge-tts failed — trying pipx install..."
-    pipx install edge-tts
-fi
+step "Constructing Isolated Application Sandbox Environment"
+mkdir -p "$APP_DIR" "$BIN_DIR"
+python3 -m venv "$VENV_DIR"
 
-# ── Install script ────────────────────────────────────────────────────────────
-step "Installing readaloud..."
-INSTALL_DIR="$HOME/.local/bin"
-mkdir -p "$INSTALL_DIR"
-cp readaloud "$INSTALL_DIR/readaloud"
-chmod +x "$INSTALL_DIR/readaloud"
-info "Installed to $INSTALL_DIR/readaloud"
+step "Injecting Core Python Dependencies into Sandbox"
+"$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
+"$VENV_DIR/bin/pip" install ebooklib edge-tts pykokoro onnxruntime
 
-# ── PATH check ────────────────────────────────────────────────────────────────
-if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
-    warn "$INSTALL_DIR is not in your PATH."
-    echo "   Add this to your ~/.bashrc or ~/.zshrc:"
-    echo "   export PATH=\"\$HOME/.local/bin:\$PATH\""
-fi
+step "Deploying Precompiled Language Splitter Weights (Python 3.14 Safe)"
+# Directly installs pure wheel to bypass standard Cython syntax building traps
+"$VENV_DIR/bin/pip" install "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
 
-echo ""
-info "Done! Run: readaloud book.epub"
+step "Installing Executable Wrapper Logic"
+cp readaloud.py "$APP_DIR/readaloud.py"
+chmod +x "$APP_DIR/readaloud.py"
+
+cat << 'EOF' > "$BIN_DIR/readaloud"
+#!/usr/bin/env bash
+APP_DIR="$HOME/.local/share/readaloud"
+exec "$APP_DIR/venv/bin/python" "$APP_DIR/readaloud.py" "$@"
+EOF
+chmod +x "$BIN_DIR/readaloud"
+
+info "Application successfully isolated and deployed to $BIN_DIR/readaloud"
