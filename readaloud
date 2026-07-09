@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 readaloud — EPUB/TXT reader with multi-backend neural TTS
-Backends: edge-tts (online), pykokoro, piper, f5-tts (offline)
+Backends: edge-tts (online), kokoro, piper, f5-tts (offline)
 Deps: ebooklib (pip), edge-tts (pipx), ffplay (ffmpeg)
-       pykokoro + onnxruntime (offline kokoro backend)
 Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 """
@@ -59,24 +58,12 @@ class EdgeTTSBackend(BaseTTSBackend):
 
 
 class KokoroBackend(BaseTTSBackend):
-    """Kokoro offline TTS via pykokoro — pure-Python ONNX wrapper, no Cython required.
-    Install: pip install pykokoro onnxruntime soundfile
-    pykokoro bypasses the legacy kokoro Cython/C-extension stack and runs inference
-    directly through onnxruntime, making it compatible with Python 3.14+.
+    """Kokoro offline TTS — fast, high-quality CPU inference.
+    Supports both 'kokoro' (native, Python <3.13) and 'pykokoro'
+    (pure-Python ONNX wrapper, Python 3.13+).
     """
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
-        # Primary: pykokoro library (pure-Python ONNX, Python 3.14 compatible)
-        try:
-            import pykokoro
-            import soundfile as sf
-            # pykokoro API: generate(text, voice, speed) → numpy audio array at 24000 Hz
-            audio = pykokoro.generate(text, voice=voice, speed=speed)
-            sf.write(output_path, audio, 24000)
-            log.debug("pykokoro generated %s", output_path)
-            return True
-        except Exception as e:
-            log.debug("pykokoro error: %s", e)
-        # Fallback: legacy kokoro KPipeline (Python <3.14 environments where it compiled)
+        # Try native kokoro library first (Python <3.13)
         try:
             from kokoro import KPipeline
             import soundfile as sf
@@ -87,9 +74,25 @@ class KokoroBackend(BaseTTSBackend):
                 sf.write(output_path, audio, 24000)
                 return True
             return False
+        except ImportError:
+            log.debug("kokoro not available, trying pykokoro")
         except Exception as e:
-            log.debug("kokoro KPipeline error: %s", e)
-        # Last resort: kokoro CLI binary
+            log.debug("kokoro error: %s", e)
+
+        # pykokoro fallback (pure-Python ONNX, works on Python 3.13+)
+        try:
+            import pykokoro
+            import soundfile as sf
+            pipeline  = pykokoro.Pipeline(voice=voice, speed=speed)
+            audio     = pipeline(text)
+            sf.write(output_path, audio, 24000)
+            return True
+        except ImportError:
+            log.debug("pykokoro not available, trying CLI")
+        except Exception as e:
+            log.debug("pykokoro error: %s", e)
+
+        # Last resort: CLI
         try:
             subprocess.run(
                 ["kokoro", "--voice", voice, "--text", text, "--output", output_path],
@@ -185,36 +188,15 @@ ENGINE_META: Dict[str, Dict[str, str]] = {
 
 
 class SystemScanner:
-    """Runs once at startup; discovers which TTS backends are usable.
-    Also tracks critical missing system deps so the TUI can show an
-    instructions overlay instead of crashing or silently failing.
-    """
-
-    # Populated during scan(); read by TUI for defensive overlay
-    missing_critical: List[str] = []
+    """Runs once at startup; discovers which TTS backends are usable."""
 
     @staticmethod
     def scan() -> Dict[str, bool]:
         status: Dict[str, bool] = {k: False for k in ENGINE_META}
-        SystemScanner.missing_critical = []
 
-        has_ffmpeg = bool(shutil.which("ffmpeg"))
-        has_ffplay = bool(shutil.which("ffplay"))
-        if not has_ffmpeg:
-            SystemScanner.missing_critical.append(
-                "ffmpeg not found — install: sudo pacman -S ffmpeg")
-        if not has_ffplay:
-            SystemScanner.missing_critical.append(
-                "ffplay not found — install: sudo pacman -S ffmpeg")
-        if not (has_ffmpeg and has_ffplay):
+        if not (shutil.which("ffmpeg") and shutil.which("ffplay")):
             log.warning("ffmpeg/ffplay missing — no audio possible")
             return status
-
-        try:
-            import ebooklib  # noqa: F401
-        except ImportError:
-            SystemScanner.missing_critical.append(
-                "ebooklib not found — install: pip install --break-system-packages ebooklib")
 
         # edge-tts: pipx available or direct import
         try:
@@ -224,20 +206,17 @@ class SystemScanner:
             if shutil.which("edge-tts") or shutil.which("pipx"):
                 status["edge-tts"] = True
 
-        # kokoro — detect pykokoro (pure-Python ONNX wrapper) first, then legacy kokoro
+        # kokoro — accepts native kokoro, pykokoro (Python 3.13+ ONNX wrapper), or CLI
         try:
-            import pykokoro  # noqa: F401
+            import kokoro  # noqa: F401
             status["kokoro"] = True
-            log.debug("Scanner: pykokoro detected")
         except ImportError:
             try:
-                import kokoro  # noqa: F401  (legacy, requires Cython build)
+                import pykokoro  # noqa: F401
                 status["kokoro"] = True
-                log.debug("Scanner: legacy kokoro detected")
             except ImportError:
                 if shutil.which("kokoro"):
                     status["kokoro"] = True
-                    log.debug("Scanner: kokoro CLI binary detected")
 
         # piper
         if shutil.which("piper"):
@@ -941,10 +920,6 @@ class TUI:
         curses.curs_set(0)
         self.scr.timeout(200)
         curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-        # Defensive overlay — show install instructions if critical deps are absent
-        if SystemScanner.missing_critical:
-            self._draw_missing_deps_screen()
-            return
         while self.running:
             try:
                 self._draw()
@@ -958,54 +933,6 @@ class TUI:
                     self._handle_key(key)
             except Exception:
                 log.exception("key error key=%d", key)
-
-    # ── Defensive missing-deps screen ─────────────────────────────────────────
-
-    def _draw_missing_deps_screen(self):
-        """Block the UI and display install instructions when critical deps are absent.
-        Pressing any key exits cleanly rather than dropping to a shell traceback.
-        """
-        self.scr.clear()
-        H, W = self.scr.getmaxyx()
-        missing = SystemScanner.missing_critical
-
-        title   = " readaloud — missing dependencies "
-        header  = title.center(W - 1)
-        try:
-            self.scr.addstr(0, 0, " " * (W - 1), self._cp("err", bold=True))
-            self.scr.addstr(0, 0, header[: W - 1],  self._cp("err", bold=True))
-        except curses.error:
-            pass
-
-        self._sa(2, 2, "The following required components were not found:", self._cp("normal", bold=True))
-
-        for i, msg in enumerate(missing):
-            self._sa(4 + i, 4, f"✗  {msg}", self._cp("err", bold=True))
-
-        install_hint_y = 4 + len(missing) + 2
-        hints = [
-            "Quick fix for Arch Linux:",
-            "  sudo pacman -S ffmpeg python-pipx",
-            "  pip install --break-system-packages ebooklib",
-            "",
-            "Or use the isolated venv installer (recommended):",
-            "  ./install.sh",
-            "",
-            "Full install instructions: see README.md",
-            "",
-            "Debug log: " + str(LOG_PATH),
-        ]
-        for j, line in enumerate(hints):
-            attr = self._cp("accent", bold=True) if line.startswith("  ") else self._cp("dim")
-            self._sa(install_hint_y + j, 2, line[: W - 3], attr)
-
-        footer = " Press any key to exit "
-        self._sa(H - 2, 0, " " * (W - 1), self._cp("ftr"))
-        self._sa(H - 2, max(0, (W - len(footer)) // 2), footer, self._cp("ftr", bold=True))
-
-        self.scr.refresh()
-        self.scr.timeout(-1)   # block until keypress
-        self.scr.getch()
 
     # ── Draw dispatcher ───────────────────────────────────────────────────────
 

@@ -74,12 +74,29 @@ info "ebooklib, edge-tts, soundfile installed"
 
 # ── Kokoro (offline, fast CPU TTS) ───────────────────────────────────────────
 step "Installing Kokoro Offline TTS"
-if "$VENV_DIR/bin/pip" install "kokoro>=0.9.4" 2>&1 | grep -q "Successfully installed"; then
-    info "kokoro installed"
-else
-    # pip install may print 'already satisfied' which also counts as success
-    "$VENV_DIR/bin/pip" install "kokoro>=0.9.4"
-    info "kokoro installed"
+PY_VERSION=$("$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+info "Python version in venv: $PY_VERSION"
+
+KOKORO_OK=false
+# kokoro 0.9.x requires Python <3.13 — try it first on compatible versions
+if "$VENV_DIR/bin/python" -c "import sys; exit(0 if sys.version_info < (3,13) else 1)" 2>/dev/null; then
+    if "$VENV_DIR/bin/pip" install "kokoro>=0.9.4" 2>/dev/null; then
+        info "kokoro installed (native)"
+        KOKORO_OK=true
+    fi
+fi
+
+# Python 3.13+ fallback: pykokoro is a pure-Python ONNX wrapper with no version cap
+if [ "$KOKORO_OK" = false ]; then
+    warn "kokoro>=0.9.4 is not available for Python $PY_VERSION (requires <3.13)"
+    warn "Falling back to pykokoro — pure-Python ONNX wrapper, same voices"
+    if "$VENV_DIR/bin/pip" install pykokoro onnxruntime soundfile 2>/dev/null; then
+        info "pykokoro + onnxruntime installed"
+        KOKORO_OK=true
+    else
+        warn "pykokoro install failed — Kokoro engine will show as unavailable"
+        warn "Try manually: $VENV_DIR/bin/pip install pykokoro onnxruntime"
+    fi
 fi
 
 # ── Piper (offline, ONNX TTS) ────────────────────────────────────────────────
