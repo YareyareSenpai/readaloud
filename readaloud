@@ -1818,9 +1818,34 @@ def pick_file(stdscr):
             else: return str(path)
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ==============================================================================
+# ─── MAIN EXECUTION ENTRY POINT ────────────────────────────────────────────────
+# ==============================================================================
 
 def main():
+    """
+    Main entry point required by pyproject.toml [project.scripts].
+    Wraps command-line arguments parsing, configuration handling, book parsing, 
+    and initializes the curses interface cleanly.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="readaloud — EPUB/TXT reader with multi-backend neural TTS"
+    )
+    parser.add_argument(
+        "file", 
+        nargs="?", 
+        help="Path to an EPUB or TXT file to read. If omitted, opens the file picker."
+    )
+    parser.add_argument(
+        "--debug", 
+        action="store_true", 
+        help="Start application with the live debug overlay panel enabled."
+    )
+    args = parser.parse_args()
+
+    # 1. Enforce defensive environment checks before booting the UI
     check_deps()
     cfg = load_config()
 
@@ -1834,41 +1859,61 @@ def main():
         cfg["engine"] = available[0] if available else "edge-tts"
         log.warning("Configured engine unavailable, using: %s", cfg["engine"])
 
-    start_debug = "--debug" in sys.argv
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    start_debug = args.debug
 
-    if args:
-        filepath = args[0]
-    else:
+    # 2. Extract or pick target file path
+    filepath = args.file
+    if not filepath:
+        # Fall back to your terminal file picker overlay if no file arguments passed
         filepath = curses.wrapper(pick_file)
         if not filepath:
-            print("No file selected."); sys.exit(0)
+            print("No file selected.")
+            sys.exit(0)
 
     if not os.path.exists(filepath):
-        print(f"File not found: {filepath}"); sys.exit(1)
+        print(f"File not found: {filepath}")
+        sys.exit(1)
 
+    # 3. Parse input document chapters
     ext = Path(filepath).suffix.lower()
     print(f"Parsing {Path(filepath).name}…", end="", flush=True)
     try:
-        if ext == ".epub":   chapters = parse_epub(filepath)
-        elif ext == ".txt":  chapters = parse_txt(filepath)
-        else: print(f"\nUnsupported: {ext}"); sys.exit(1)
+        if ext == ".epub":
+            chapters = parse_epub(filepath)
+        elif ext == ".txt":
+            chapters = parse_txt(filepath)
+        else:
+            print(f"\nUnsupported: {ext}")
+            sys.exit(1)
     except Exception as e:
         print(f"\nParse error: {e}")
         log.exception("parse error")
         sys.exit(1)
 
     if not chapters:
-        print("\nNo readable chapters found."); sys.exit(1)
+        print("\nNo readable chapters found.")
+        sys.exit(1)
+
     print(f" {len(chapters)} chapters.")
     cfg["last_file"] = filepath
     save_config(cfg)
     log.info("starting TUI: %s  %d chapters  debug=%s", filepath, len(chapters), start_debug)
 
+    # 4. Boot the main Reader UI layout inside the curses environment wrapper safely
     def _run(s):
         TUI(s, chapters, filepath, cfg, start_debug=start_debug).run()
 
-    curses.wrapper(_run)
+    try:
+        curses.wrapper(_run)
+    except KeyboardInterrupt:
+        log.info("Application closed via KeyboardInterrupt.")
+    except Exception as e:
+        # Prevent terminal window freezing by logging unexpected crashes to the config folder
+        log.critical("Application crashed unexpectedly: %s", traceback.format_exc())
+        sys.stderr.write(f"\nAn unexpected error occurred. Please check {LOG_PATH}\n")
+        sys.exit(1)
 
 if __name__ == "__main__":
+    # This allows direct execution via 'python readaloud' while staying 
+    # completely compatible with pipx environment wrapper entry hooks.
     main()
