@@ -56,85 +56,58 @@ Engines are auto-detected at startup. Only available engines appear as selectabl
 
 ## Requirements
 
-### Core (required for all engines)
+### Host system (always required)
 
 | Dependency | Purpose | Install |
 |---|---|---|
-| Python 3.9+ | Runtime | pre-installed on most distros |
-| `ebooklib` | EPUB parsing | `pip install --break-system-packages ebooklib` |
+| Python 3.10+ | Runtime | pre-installed on most distros |
 | `ffplay` | Audio playback (part of ffmpeg) | `sudo pacman -S ffmpeg` |
+| `pipx` | Edge TTS isolation | `sudo pacman -S python-pipx` |
 
-### Edge TTS (online, default)
+Everything else (Python packages, engine binaries) is handled automatically by `install.sh` inside an isolated venv. No `--break-system-packages` needed.
 
-| Dependency | Purpose | Install |
-|---|---|---|
-| `pipx` | Run `edge-tts` in isolation | `sudo pacman -S python-pipx` |
-| `edge-tts` | Microsoft neural TTS | auto-fetched via `pipx run` on first use |
+### What the installer handles automatically
 
-> Requires an internet connection. No API key needed.
+| Engine | What gets installed |
+|--------|---------------------|
+| **Edge TTS** | `edge-tts` package in venv; invoked via `pipx run` |
+| **Kokoro** | `kokoro`, `soundfile`, `onnxruntime` in venv |
+| **Piper** | `piper-tts` in venv; binary symlinked to `~/.local/bin/piper` |
+| **F5-TTS** | `f5-tts` in venv (skipped gracefully if torch/CUDA missing); binary symlinked to `~/.local/bin/f5-tts_infer-cli` |
 
-### Kokoro (offline)
+### What you must provide manually (post-install)
+
+**Piper** requires model files — the binary alone is not enough:
 
 ```bash
-pip install --break-system-packages kokoro soundfile
-```
-
-### Piper (offline)
-
-```bash
-# Install piper binary
-pip install --break-system-packages piper-tts
-
-# Download a model (example — en_US-lessac-medium)
-mkdir -p ~/.config/readaloud/models
+# Download a model — you need BOTH the .onnx and .onnx.json files
 wget -P ~/.config/readaloud/models \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+wget -P ~/.config/readaloud/models \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 ```
 
-Any `.onnx` file placed in `~/.config/readaloud/models/` is automatically detected and listed in the voices panel.
+Any `.onnx` + `.onnx.json` pair in `~/.config/readaloud/models/` is auto-detected and listed in the voices panel.
 
-### F5-TTS (offline, voice cloning)
+**F5-TTS** requires a reference voice clip:
 
 ```bash
-pip install --break-system-packages f5-tts
-
-# Place your reference audio (3–10 seconds of clean speech)
+# Place 3–10 seconds of clean, single-speaker audio here
 cp your_voice.wav ~/.config/readaloud/voices/ref.wav
 
-# Optional: transcript of the reference clip (improves alignment)
+# Optional: transcript of the clip (improves synthesis alignment)
 echo "Your reference text here." > ~/.config/readaloud/voices/ref.txt
 ```
 
-GPU (CUDA) is strongly recommended for F5-TTS; CPU generation is slow but functional.
-
----
-
-## Distro Quick-Start
-
-### Arch Linux
-
-```bash
-sudo pacman -S python-pipx ffmpeg
-pip install --break-system-packages ebooklib
-```
-
-### Debian / Ubuntu
-
-```bash
-sudo apt install pipx ffmpeg
-pip install ebooklib
-```
-
-### Fedora
-
-```bash
-sudo dnf install pipx ffmpeg
-pip install ebooklib
-```
+GPU (CUDA) is strongly recommended for F5-TTS; CPU generation works but is slow.
 
 ---
 
 ## Installation
+
+### Method 1 — install.sh (recommended)
+
+Installs everything into an isolated venv at `~/.local/share/readaloud/venv/` and places a launcher at `~/.local/bin/readaloud`. No host Python pollution.
 
 ```bash
 git clone https://github.com/YareyareSenpai/readaloud.git
@@ -142,18 +115,69 @@ cd readaloud
 chmod +x install.sh && ./install.sh
 ```
 
-Or manually:
+The script auto-detects your distro (Arch / Debian / Fedora) and installs host packages (`ffmpeg`, `python-pipx`) via the appropriate package manager, then builds the venv and installs all engines.
+
+### Method 2 — pipx (single-command, portable)
+
+Installs `readaloud` as a fully isolated pipx app with Edge TTS + Kokoro as the default set:
+
+```bash
+pipx install .
+```
+
+Install with specific offline engines:
+
+```bash
+pipx install ".[kokoro]"     # + Kokoro
+pipx install ".[piper]"      # + Piper
+pipx install ".[f5]"         # + F5-TTS (needs torch)
+pipx install ".[all]"        # everything
+```
+
+### Method 3 — manual (no script)
 
 ```bash
 cp readaloud.py ~/.local/bin/readaloud
 chmod +x ~/.local/bin/readaloud
 ```
 
-Make sure `~/.local/bin` is in your `PATH`:
+You are responsible for installing all dependencies yourself in this case. See the engine table above.
+
+### PATH
+
+Make sure `~/.local/bin` is in your `PATH` (required for all methods):
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
+```
+
+---
+
+## Verifying the Install
+
+```bash
+# Confirm the launcher is reachable
+which readaloud
+
+# Confirm audio playback works
+which ffplay
+
+# Confirm Piper binary is linked (if using Piper)
+which piper
+
+# Run with debug overlay to see engine availability at startup
+readaloud --debug somebook.epub
+```
+
+In the TUI, press `v` to open the voices panel. Each engine shows either a check mark (available) or `✗` (not detected). Engines greyed with `✗` need either a missing binary, a missing model file, or a missing `ref.wav` — the debug overlay (`?`) will show the exact availability map.
+
+To clean up and reinstall from scratch:
+
+```bash
+rm -rf ~/.local/share/readaloud
+rm -f ~/.local/bin/readaloud ~/.local/bin/piper ~/.local/bin/f5-tts_infer-cli
+# Then re-run: ./install.sh
 ```
 
 ---
@@ -373,12 +397,14 @@ sudo pacman -S ffmpeg
 
 **ebooklib import error**
 ```bash
-pip install --break-system-packages ebooklib
+# If using install.sh:
+~/.local/share/readaloud/venv/bin/pip install ebooklib
+# If using pipx: pipx inject readaloud ebooklib
 ```
 
 **Kokoro not detected**
 ```bash
-pip install --break-system-packages kokoro soundfile
+~/.local/share/readaloud/venv/bin/pip install "kokoro>=0.9.4" soundfile
 ```
 
 **Piper model not found**
