@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 readaloud — EPUB/TXT reader with multi-backend neural TTS
-Backends: edge-tts (online), kokoro, piper, f5-tts (offline)
+Backends: edge-tts (online), pykokoro, piper, f5-tts (offline)
 Deps: ebooklib (pip), edge-tts (pipx), ffplay (ffmpeg)
+       pykokoro + onnxruntime (offline kokoro backend)
 Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 """
@@ -58,9 +59,24 @@ class EdgeTTSBackend(BaseTTSBackend):
 
 
 class KokoroBackend(BaseTTSBackend):
-    """Kokoro offline TTS — fast, high-quality CPU inference."""
+    """Kokoro offline TTS via pykokoro — pure-Python ONNX wrapper, no Cython required.
+    Install: pip install pykokoro onnxruntime soundfile
+    pykokoro bypasses the legacy kokoro Cython/C-extension stack and runs inference
+    directly through onnxruntime, making it compatible with Python 3.14+.
+    """
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
-        # Try Python library first
+        # Primary: pykokoro library (pure-Python ONNX, Python 3.14 compatible)
+        try:
+            import pykokoro
+            import soundfile as sf
+            # pykokoro API: generate(text, voice, speed) → numpy audio array at 24000 Hz
+            audio = pykokoro.generate(text, voice=voice, speed=speed)
+            sf.write(output_path, audio, 24000)
+            log.debug("pykokoro generated %s", output_path)
+            return True
+        except Exception as e:
+            log.debug("pykokoro error: %s", e)
+        # Fallback: legacy kokoro KPipeline (Python <3.14 environments where it compiled)
         try:
             from kokoro import KPipeline
             import soundfile as sf
@@ -72,8 +88,8 @@ class KokoroBackend(BaseTTSBackend):
                 return True
             return False
         except Exception as e:
-            log.debug("Kokoro lib error, trying CLI: %s", e)
-        # Fallback to CLI
+            log.debug("kokoro KPipeline error: %s", e)
+        # Last resort: kokoro CLI binary
         try:
             subprocess.run(
                 ["kokoro", "--voice", voice, "--text", text, "--output", output_path],
@@ -169,15 +185,36 @@ ENGINE_META: Dict[str, Dict[str, str]] = {
 
 
 class SystemScanner:
-    """Runs once at startup; discovers which TTS backends are usable."""
+    """Runs once at startup; discovers which TTS backends are usable.
+    Also tracks critical missing system deps so the TUI can show an
+    instructions overlay instead of crashing or silently failing.
+    """
+
+    # Populated during scan(); read by TUI for defensive overlay
+    missing_critical: List[str] = []
 
     @staticmethod
     def scan() -> Dict[str, bool]:
         status: Dict[str, bool] = {k: False for k in ENGINE_META}
+        SystemScanner.missing_critical = []
 
-        if not (shutil.which("ffmpeg") and shutil.which("ffplay")):
+        has_ffmpeg = bool(shutil.which("ffmpeg"))
+        has_ffplay = bool(shutil.which("ffplay"))
+        if not has_ffmpeg:
+            SystemScanner.missing_critical.append(
+                "ffmpeg not found — install: sudo pacman -S ffmpeg")
+        if not has_ffplay:
+            SystemScanner.missing_critical.append(
+                "ffplay not found — install: sudo pacman -S ffmpeg")
+        if not (has_ffmpeg and has_ffplay):
             log.warning("ffmpeg/ffplay missing — no audio possible")
             return status
+
+        try:
+            import ebooklib  # noqa: F401
+        except ImportError:
+            SystemScanner.missing_critical.append(
+                "ebooklib not found — install: pip install --break-system-packages ebooklib")
 
         # edge-tts: pipx available or direct import
         try:
@@ -187,13 +224,20 @@ class SystemScanner:
             if shutil.which("edge-tts") or shutil.which("pipx"):
                 status["edge-tts"] = True
 
-        # kokoro
+        # kokoro — detect pykokoro (pure-Python ONNX wrapper) first, then legacy kokoro
         try:
-            import kokoro  # noqa: F401
+            import pykokoro  # noqa: F401
             status["kokoro"] = True
+            log.debug("Scanner: pykokoro detected")
         except ImportError:
-            if shutil.which("kokoro"):
+            try:
+                import kokoro  # noqa: F401  (legacy, requires Cython build)
                 status["kokoro"] = True
+                log.debug("Scanner: legacy kokoro detected")
+            except ImportError:
+                if shutil.which("kokoro"):
+                    status["kokoro"] = True
+                    log.debug("Scanner: kokoro CLI binary detected")
 
         # piper
         if shutil.which("piper"):
@@ -261,115 +305,29 @@ def get_manager() -> MasterPlaybackManager:
 
 # ─── Dependency check ─────────────────────────────────────────────────────────
 
-def _collect_missing_deps() -> list:
-    """Return a list of (label, install_cmd) tuples for missing hard deps."""
+def check_deps():
     missing = []
     try:
         import ebooklib  # noqa: F401
     except ImportError:
-        missing.append(("ebooklib", "pip install --break-system-packages ebooklib"))
+        missing.append("ebooklib  →  pip install --break-system-packages ebooklib")
     if not shutil.which("ffplay"):
-        missing.append(("ffplay (ffmpeg)", "sudo pacman -S ffmpeg   # or apt/dnf equivalent"))
-    # edge-tts: required as the online fallback
+        missing.append("ffplay    →  sudo pacman -S ffmpeg")
+    # edge-tts is the fallback — warn if neither pipx nor the module is present
     try:
         r = subprocess.run(["pipx", "run", "edge-tts", "--version"],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=30)
         if r.returncode != 0:
-            missing.append(("edge-tts", "pipx install edge-tts"))
+            missing.append("edge-tts  →  pipx install edge-tts")
     except (FileNotFoundError, subprocess.TimeoutExpired):
         try:
             import edge_tts  # noqa: F401
         except ImportError:
-            missing.append(("edge-tts", "pipx install edge-tts   (pacman -S python-pipx)"))
-    return missing
-
-
-def _show_missing_deps_screen(stdscr, missing: list):
-    """Full-screen curses overlay listing missing deps; press q or Enter to abort."""
-    curses.curs_set(0)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_WHITE,  -1)
-    curses.init_pair(2, curses.COLOR_CYAN,   -1)
-    curses.init_pair(3, curses.COLOR_RED,    -1)
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)
-    curses.init_pair(5, curses.COLOR_GREEN,  -1)
-    stdscr.timeout(100)
-
-    BOX_H = {"tl":"╭","tr":"╮","bl":"╰","br":"╯","h":"─","v":"│"}
-
-    while True:
-        stdscr.erase()
-        H, W = stdscr.getmaxyx()
-
-        # Header bar
-        try:
-            stdscr.addstr(0, 0, " " * (W - 1),
-                          curses.color_pair(3) | curses.A_BOLD)
-            stdscr.addstr(0, 0, "  ✗  readaloud — missing dependencies",
-                          curses.color_pair(3) | curses.A_BOLD)
-        except curses.error:
-            pass
-
-        stdscr.addstr(1, 0, "─" * (W - 1), curses.color_pair(2))
-
-        y = 3
-        stdscr.addstr(y, 2,
-            "The following required packages or binaries were not found:",
-            curses.color_pair(1) | curses.A_BOLD)
-        y += 2
-
-        for label, cmd in missing:
-            if y >= H - 6:
-                break
-            stdscr.addstr(y,     4, f"✗  {label}",
-                          curses.color_pair(3) | curses.A_BOLD)
-            stdscr.addstr(y + 1, 6, f"→  {cmd}",
-                          curses.color_pair(4))
-            y += 3
-
-        # Box with instructions
-        bw = min(W - 4, 64)
-        bx = (W - bw) // 2
-        by = H - 7
-        if by > y + 1 and bw > 20:
-            try:
-                stdscr.addstr(by,     bx, BOX_H["tl"] + BOX_H["h"] * (bw - 2) + BOX_H["tr"],
-                              curses.color_pair(2))
-                stdscr.addstr(by + 1, bx, BOX_H["v"],  curses.color_pair(2))
-                stdscr.addstr(by + 1, bx + 1,
-                    " Install the packages above, then re-run readaloud.".center(bw - 2)[:bw - 2],
-                    curses.color_pair(5) | curses.A_BOLD)
-                stdscr.addstr(by + 1, bx + bw - 1, BOX_H["v"], curses.color_pair(2))
-                stdscr.addstr(by + 2, bx, BOX_H["v"],  curses.color_pair(2))
-                stdscr.addstr(by + 2, bx + 1,
-                    " Debug log: ~/.config/readaloud/debug.log".center(bw - 2)[:bw - 2],
-                    curses.color_pair(1))
-                stdscr.addstr(by + 2, bx + bw - 1, BOX_H["v"], curses.color_pair(2))
-                stdscr.addstr(by + 3, bx, BOX_H["bl"] + BOX_H["h"] * (bw - 2) + BOX_H["br"],
-                              curses.color_pair(2))
-            except curses.error:
-                pass
-
-        stdscr.addstr(H - 2, 2, "  Press q or Enter to exit",
-                      curses.color_pair(1))
-        stdscr.refresh()
-
-        k = stdscr.getch()
-        if k in (ord('q'), ord('Q'), curses.KEY_ENTER, 10, 13, 27):
-            break
-
-
-def check_deps():
-    missing = _collect_missing_deps()
+            missing.append("edge-tts  →  pipx install edge-tts  (pacman -S python-pipx)")
     if missing:
-        # Try to show curses overlay; fall back to plain stderr if terminal isn't ready
-        try:
-            curses.wrapper(_show_missing_deps_screen, missing)
-        except Exception:
-            sys.stderr.write("\n✗ Missing dependencies:\n")
-            for label, cmd in missing:
-                sys.stderr.write(f"  {label}  →  {cmd}\n")
+        print("\033[1;31m✗ Missing dependencies:\033[0m")
+        for m in missing:
+            print(f"  {m}")
         sys.exit(1)
 
 
@@ -499,9 +457,9 @@ THEMES = {
             "hdr":     (curses.COLOR_WHITE,    curses.COLOR_BLUE),
             "ftr":     (curses.COLOR_BLACK,    curses.COLOR_WHITE),
             "hl":      (curses.COLOR_BLACK,    curses.COLOR_YELLOW),
-            "bm":      (curses.COLOR_GREEN,   -1),
+            "bm":      (curses.COLOR_BLACK,    curses.COLOR_GREEN),
             "btn":     (curses.COLOR_BLACK,    curses.COLOR_CYAN),
-            "rpanel":  (curses.COLOR_WHITE,   -1),   # transparent bg — blends with terminal
+            "rpanel":  (curses.COLOR_WHITE,    curses.COLOR_BLUE),
             "offline": (curses.COLOR_GREEN,   -1),
             "online":  (curses.COLOR_CYAN,    -1),
         },
@@ -512,14 +470,13 @@ THEMES = {
             "bg":(80,90,120),"fg":(900,910,940),"accent":(400,780,980),
             "yellow":(980,800,200),"green":(300,860,500),"red":(980,350,350),
             "dim":(650,550,800),"hdr_bg":(50,60,90),"hl_bg":(800,700,100),
-            # rp_bg matches bg exactly — no distinct panel colour
-            "rp_bg":(80,90,120),
+            "rp_bg":(60,70,100),
         },
         "pairs": {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
-            "btn":(17,18),"rpanel":(16,17),"offline":(20,17),"online":(18,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
+            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
         },
     },
     "gruvbox": {
@@ -528,13 +485,13 @@ THEMES = {
             "bg":(156,141,100),"fg":(980,920,760),"accent":(980,740,180),
             "yellow":(980,740,180),"green":(690,730,200),"red":(980,360,220),
             "dim":(800,550,380),"hdr_bg":(120,110,80),"hl_bg":(980,740,180),
-            "rp_bg":(156,141,100),
+            "rp_bg":(130,120,90),
         },
         "pairs": {
             "normal":(16,17),"accent":(19,17),"sel":(17,19),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
-            "btn":(17,19),"rpanel":(16,17),"offline":(20,17),"online":(19,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
+            "btn":(17,19),"rpanel":(16,25),"offline":(20,17),"online":(19,17),
         },
     },
     "nord": {
@@ -543,13 +500,13 @@ THEMES = {
             "bg":(184,204,239),"fg":(840,870,910),"accent":(530,750,870),
             "yellow":(920,796,545),"green":(638,745,549),"red":(749,380,416),
             "dim":(700,600,780),"hdr_bg":(149,168,203),"hl_bg":(920,796,545),
-            "rp_bg":(184,204,239),
+            "rp_bg":(160,180,215),
         },
         "pairs": {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
-            "btn":(17,18),"rpanel":(16,17),"offline":(20,17),"online":(18,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
+            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
         },
     },
     "solarized": {
@@ -558,13 +515,13 @@ THEMES = {
             "bg":(0,168,211),"fg":(513,580,588),"accent":(149,545,823),
             "yellow":(709,537,0),"green":(521,600,0),"red":(862,196,184),
             "dim":(423,443,768),"hdr_bg":(0,121,168),"hl_bg":(709,537,0),
-            "rp_bg":(0,168,211),
+            "rp_bg":(0,100,140),
         },
         "pairs": {
             "normal":(16,17),"accent":(18,17),"sel":(17,18),
             "playing":(19,17),"ok":(20,17),"err":(21,17),"dim":(22,17),
-            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(20,17),
-            "btn":(17,18),"rpanel":(16,17),"offline":(20,17),"online":(18,17),
+            "hdr":(16,23),"ftr":(17,16),"hl":(17,24),"bm":(17,20),
+            "btn":(17,18),"rpanel":(16,25),"offline":(20,17),"online":(18,17),
         },
     },
 }
@@ -984,6 +941,10 @@ class TUI:
         curses.curs_set(0)
         self.scr.timeout(200)
         curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        # Defensive overlay — show install instructions if critical deps are absent
+        if SystemScanner.missing_critical:
+            self._draw_missing_deps_screen()
+            return
         while self.running:
             try:
                 self._draw()
@@ -997,6 +958,54 @@ class TUI:
                     self._handle_key(key)
             except Exception:
                 log.exception("key error key=%d", key)
+
+    # ── Defensive missing-deps screen ─────────────────────────────────────────
+
+    def _draw_missing_deps_screen(self):
+        """Block the UI and display install instructions when critical deps are absent.
+        Pressing any key exits cleanly rather than dropping to a shell traceback.
+        """
+        self.scr.clear()
+        H, W = self.scr.getmaxyx()
+        missing = SystemScanner.missing_critical
+
+        title   = " readaloud — missing dependencies "
+        header  = title.center(W - 1)
+        try:
+            self.scr.addstr(0, 0, " " * (W - 1), self._cp("err", bold=True))
+            self.scr.addstr(0, 0, header[: W - 1],  self._cp("err", bold=True))
+        except curses.error:
+            pass
+
+        self._sa(2, 2, "The following required components were not found:", self._cp("normal", bold=True))
+
+        for i, msg in enumerate(missing):
+            self._sa(4 + i, 4, f"✗  {msg}", self._cp("err", bold=True))
+
+        install_hint_y = 4 + len(missing) + 2
+        hints = [
+            "Quick fix for Arch Linux:",
+            "  sudo pacman -S ffmpeg python-pipx",
+            "  pip install --break-system-packages ebooklib",
+            "",
+            "Or use the isolated venv installer (recommended):",
+            "  ./install.sh",
+            "",
+            "Full install instructions: see README.md",
+            "",
+            "Debug log: " + str(LOG_PATH),
+        ]
+        for j, line in enumerate(hints):
+            attr = self._cp("accent", bold=True) if line.startswith("  ") else self._cp("dim")
+            self._sa(install_hint_y + j, 2, line[: W - 3], attr)
+
+        footer = " Press any key to exit "
+        self._sa(H - 2, 0, " " * (W - 1), self._cp("ftr"))
+        self._sa(H - 2, max(0, (W - len(footer)) // 2), footer, self._cp("ftr", bold=True))
+
+        self.scr.refresh()
+        self.scr.timeout(-1)   # block until keypress
+        self.scr.getch()
 
     # ── Draw dispatcher ───────────────────────────────────────────────────────
 
@@ -1181,6 +1190,10 @@ class TUI:
     def _draw_rp_voices(self, left, width, top, height):
         focused = self.focus == "rpanel"
 
+        # Background fill
+        for r in range(height):
+            self._sa(top+r, left, " "*width, self._cp("rpanel"))
+
         # ── Header ───────────────────────────────────────────────────────────
         label = " ENGINES & VOICES" + (" ←" if focused else "")
         self._sa(top,   left, label,            self._cp("rpanel", bold=True))
@@ -1272,6 +1285,8 @@ class TUI:
         focused = self.focus == "rpanel"
         hattr   = self._cp("rpanel", bold=True)
         bms     = self.cfg["bookmarks"].get(self._bm_key, [])
+        for r in range(height):
+            self._sa(top+r, left, " "*width, self._cp("rpanel"))
         label = f" BOOKMARKS ({len(bms)})"
         if focused:
             label += " ←"
@@ -1818,34 +1833,9 @@ def pick_file(stdscr):
             else: return str(path)
 
 
-# ==============================================================================
-# ─── MAIN EXECUTION ENTRY POINT ────────────────────────────────────────────────
-# ==============================================================================
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    """
-    Main entry point required by pyproject.toml [project.scripts].
-    Wraps command-line arguments parsing, configuration handling, book parsing, 
-    and initializes the curses interface cleanly.
-    """
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="readaloud — EPUB/TXT reader with multi-backend neural TTS"
-    )
-    parser.add_argument(
-        "file", 
-        nargs="?", 
-        help="Path to an EPUB or TXT file to read. If omitted, opens the file picker."
-    )
-    parser.add_argument(
-        "--debug", 
-        action="store_true", 
-        help="Start application with the live debug overlay panel enabled."
-    )
-    args = parser.parse_args()
-
-    # 1. Enforce defensive environment checks before booting the UI
     check_deps()
     cfg = load_config()
 
@@ -1859,61 +1849,41 @@ def main():
         cfg["engine"] = available[0] if available else "edge-tts"
         log.warning("Configured engine unavailable, using: %s", cfg["engine"])
 
-    start_debug = args.debug
+    start_debug = "--debug" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
-    # 2. Extract or pick target file path
-    filepath = args.file
-    if not filepath:
-        # Fall back to your terminal file picker overlay if no file arguments passed
+    if args:
+        filepath = args[0]
+    else:
         filepath = curses.wrapper(pick_file)
         if not filepath:
-            print("No file selected.")
-            sys.exit(0)
+            print("No file selected."); sys.exit(0)
 
     if not os.path.exists(filepath):
-        print(f"File not found: {filepath}")
-        sys.exit(1)
+        print(f"File not found: {filepath}"); sys.exit(1)
 
-    # 3. Parse input document chapters
     ext = Path(filepath).suffix.lower()
     print(f"Parsing {Path(filepath).name}…", end="", flush=True)
     try:
-        if ext == ".epub":
-            chapters = parse_epub(filepath)
-        elif ext == ".txt":
-            chapters = parse_txt(filepath)
-        else:
-            print(f"\nUnsupported: {ext}")
-            sys.exit(1)
+        if ext == ".epub":   chapters = parse_epub(filepath)
+        elif ext == ".txt":  chapters = parse_txt(filepath)
+        else: print(f"\nUnsupported: {ext}"); sys.exit(1)
     except Exception as e:
         print(f"\nParse error: {e}")
         log.exception("parse error")
         sys.exit(1)
 
     if not chapters:
-        print("\nNo readable chapters found.")
-        sys.exit(1)
-
+        print("\nNo readable chapters found."); sys.exit(1)
     print(f" {len(chapters)} chapters.")
     cfg["last_file"] = filepath
     save_config(cfg)
     log.info("starting TUI: %s  %d chapters  debug=%s", filepath, len(chapters), start_debug)
 
-    # 4. Boot the main Reader UI layout inside the curses environment wrapper safely
     def _run(s):
         TUI(s, chapters, filepath, cfg, start_debug=start_debug).run()
 
-    try:
-        curses.wrapper(_run)
-    except KeyboardInterrupt:
-        log.info("Application closed via KeyboardInterrupt.")
-    except Exception as e:
-        # Prevent terminal window freezing by logging unexpected crashes to the config folder
-        log.critical("Application crashed unexpectedly: %s", traceback.format_exc())
-        sys.stderr.write(f"\nAn unexpected error occurred. Please check {LOG_PATH}\n")
-        sys.exit(1)
+    curses.wrapper(_run)
 
 if __name__ == "__main__":
-    # This allows direct execution via 'python readaloud' while staying 
-    # completely compatible with pipx environment wrapper entry hooks.
     main()
