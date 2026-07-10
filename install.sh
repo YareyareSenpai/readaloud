@@ -4,7 +4,7 @@
 # and drops a launcher at ~/.local/bin/readaloud
 set -euo pipefail
 
-# Resolve the directory this script lives in — so it can be invoked from anywhere
+# Resolve the directory this script lives in — works from any CWD
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BOLD='\033[1m'
@@ -13,16 +13,24 @@ YELLOW='\033[0;33m'
 RED='\033[0;31m'
 RESET='\033[0m'
 
-info() { echo -e " ${GREEN}✓${RESET} $1"; }
-warn() { echo -e " ${YELLOW}!${RESET} $1"; }
+info()  { echo -e " ${GREEN}✓${RESET} $1"; }
+warn()  { echo -e " ${YELLOW}!${RESET} $1"; }
 error() { echo -e " ${RED}✗${RESET} $1"; exit 1; }
-step() { echo -e "\n${BOLD}>>> $1${RESET}"; }
+step()  { echo -e "\n${BOLD}>>> $1${RESET}"; }
+
+# pip_install <args...>
+# Runs pip install; on failure prints a warning but does NOT abort the script.
+pip_install() {
+    if ! "$VENV_DIR/bin/pip" install "$@" 2>/dev/null; then
+        warn "pip install $* failed — continuing (engine will show unavailable)"
+    fi
+}
 
 # ── Distro detection ──────────────────────────────────────────────────────────
 step "Detecting Operating System"
-if command -v pacman &>/dev/null; then DISTRO="arch"
-elif command -v apt &>/dev/null;   then DISTRO="debian"
-elif command -v dnf &>/dev/null;   then DISTRO="fedora"
+if   command -v pacman &>/dev/null; then DISTRO="arch"
+elif command -v apt    &>/dev/null; then DISTRO="debian"
+elif command -v dnf    &>/dev/null; then DISTRO="fedora"
 else
     warn "Unknown distribution — ensure ffmpeg, python3, and python3-venv are installed."
     DISTRO="unknown"
@@ -69,19 +77,16 @@ info "venv: $VENV_DIR"
 
 # ── Core dependencies (always required) ──────────────────────────────────────
 step "Installing Core Dependencies"
-"$VENV_DIR/bin/pip" install \
-    ebooklib \
-    edge-tts \
-    soundfile
+"$VENV_DIR/bin/pip" install ebooklib edge-tts soundfile
 info "ebooklib, edge-tts, soundfile installed"
 
 # ── Kokoro (offline, fast CPU TTS) ───────────────────────────────────────────
 step "Installing Kokoro Offline TTS"
-PY_VERSION=$("$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-info "Python version in venv: $PY_VERSION"
+PY_VER=$("$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+info "Python version in venv: $PY_VER"
 
 KOKORO_OK=false
-# kokoro 0.9.x requires Python <3.13 — try it first on compatible versions
+# kokoro 0.9.x caps at Python <3.13 — try native first
 if "$VENV_DIR/bin/python" -c "import sys; exit(0 if sys.version_info < (3,13) else 1)" 2>/dev/null; then
     if "$VENV_DIR/bin/pip" install "kokoro>=0.9.4" 2>/dev/null; then
         info "kokoro installed (native)"
@@ -89,32 +94,32 @@ if "$VENV_DIR/bin/python" -c "import sys; exit(0 if sys.version_info < (3,13) el
     fi
 fi
 
-# Python 3.13+ fallback: pykokoro is a pure-Python ONNX wrapper with no version cap
 if [ "$KOKORO_OK" = false ]; then
-    warn "kokoro>=0.9.4 is not available for Python $PY_VERSION (requires <3.13)"
+    warn "kokoro>=0.9.4 unavailable for Python $PY_VER (requires <3.13)"
     warn "Falling back to pykokoro — pure-Python ONNX wrapper, same voices"
     if "$VENV_DIR/bin/pip" install pykokoro onnxruntime soundfile 2>/dev/null; then
         info "pykokoro + onnxruntime installed"
         KOKORO_OK=true
     else
-        warn "pykokoro install failed — Kokoro engine will show as unavailable"
+        warn "pykokoro install also failed — Kokoro engine will show as unavailable"
         warn "Try manually: $VENV_DIR/bin/pip install pykokoro onnxruntime"
     fi
 fi
 
 # ── Piper (offline, ONNX TTS) ────────────────────────────────────────────────
 step "Installing Piper Offline TTS"
-"$VENV_DIR/bin/pip" install piper-tts
-# piper-tts installs the piper binary into the venv's bin — symlink to BIN_DIR
-# so shutil.which("piper") can find it (requires ~/.local/bin on PATH)
-if [ -f "$VENV_DIR/bin/piper" ]; then
-    ln -sf "$VENV_DIR/bin/piper" "$BIN_DIR/piper"
-    info "piper binary linked to $BIN_DIR/piper"
+if "$VENV_DIR/bin/pip" install piper-tts 2>/dev/null; then
+    if [ -f "$VENV_DIR/bin/piper" ]; then
+        ln -sf "$VENV_DIR/bin/piper" "$BIN_DIR/piper"
+        info "piper binary linked to $BIN_DIR/piper"
+    else
+        warn "piper binary not found in venv after install"
+    fi
+    info "piper-tts installed"
 else
-    warn "piper binary not found in venv — may need manual install or PATH adjustment"
+    warn "piper-tts install failed — Piper engine will show as unavailable"
 fi
-warn "Piper needs .onnx model files in $MODELS_DIR"
-warn "Example download:"
+warn "Piper needs .onnx + .onnx.json model pairs in $MODELS_DIR"
 echo "      wget -P $MODELS_DIR \\"
 echo "        https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
 echo "      wget -P $MODELS_DIR \\"
@@ -122,12 +127,12 @@ echo "        https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/
 
 # ── F5-TTS (offline, voice cloning) ──────────────────────────────────────────
 step "Installing F5-TTS Voice Cloner"
-if "$VENV_DIR/bin/pip" install f5-tts; then
-    # f5-tts installs f5-tts_infer-cli into venv bin — symlink it
+if "$VENV_DIR/bin/pip" install f5-tts 2>/dev/null; then
     if [ -f "$VENV_DIR/bin/f5-tts_infer-cli" ]; then
         ln -sf "$VENV_DIR/bin/f5-tts_infer-cli" "$BIN_DIR/f5-tts_infer-cli"
         info "f5-tts_infer-cli linked to $BIN_DIR/f5-tts_infer-cli"
     fi
+    info "f5-tts installed"
     warn "F5-TTS needs a reference audio file at $VOICES_DIR/ref.wav"
     warn "Optional transcript at $VOICES_DIR/ref.txt improves alignment"
     warn "GPU (CUDA) strongly recommended — CPU generation is slow"
@@ -138,8 +143,12 @@ fi
 
 # ── Deploy application ────────────────────────────────────────────────────────
 step "Deploying readaloud"
+if [ ! -f "$SCRIPT_DIR/readaloud.py" ]; then
+    error "readaloud.py not found in $SCRIPT_DIR — run install.sh from inside the repo"
+fi
 cp "$SCRIPT_DIR/readaloud.py" "$APP_DIR/readaloud.py"
 chmod +x "$APP_DIR/readaloud.py"
+info "Deployed readaloud.py to $APP_DIR"
 
 cat << 'EOF' > "$BIN_DIR/readaloud"
 #!/usr/bin/env bash
