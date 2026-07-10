@@ -438,7 +438,7 @@ THEMES = {
             "hl":      (curses.COLOR_BLACK,    curses.COLOR_YELLOW),
             "bm":      (curses.COLOR_BLACK,    curses.COLOR_GREEN),
             "btn":     (curses.COLOR_BLACK,    curses.COLOR_CYAN),
-            "rpanel":  (curses.COLOR_CYAN,     -1),
+            "rpanel":  (curses.COLOR_WHITE,    curses.COLOR_BLUE),
             "offline": (curses.COLOR_GREEN,   -1),
             "online":  (curses.COLOR_CYAN,    -1),
         },
@@ -774,9 +774,276 @@ class Player:
         self.est_char_pos = 0
         log.debug("player stopped")
 
+    def play_cached(self, playlist: str, audio_dir: str,
+                    chapter_len: int, speed: float):
+        """Start playback from a pre-synthesized playlist (cache hit)."""
+        self.stop()
+        self._stop_evt.clear()
+        self._pause_evt.clear()
+        self._paused_total = 0.0
+        self.chapter_len   = chapter_len
+        self.est_char_pos  = 0
+        self._thread = threading.Thread(
+            target=self._run_cached, args=(playlist, audio_dir, speed), daemon=True)
+        self._thread.start()
+
+    def _run_cached(self, playlist: str, audio_dir: str, speed: float):
+        """ffplay loop for a pre-built playlist; mirrors end of _run()."""
+        tempo = speed
+        chain = []
+        while tempo > 2.0:
+            chain.append("atempo=2.0"); tempo /= 2.0
+        chain.append(f"atempo={tempo:.3f}")
+
+        self.state = "playing"
+        self.play_start_ts = time.time()
+        self._chars_per_sec = 140 / 60 * 5 * speed
+        self.error_msg = ""
+        log.debug("play_cached: %s", playlist)
+
+        try:
+            self._proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-f", "concat", "-safe", "0", "-i", playlist,
+                 "-af", ",".join(chain)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            while self._proc.poll() is None:
+                if self._stop_evt.is_set():
+                    self._proc.terminate(); break
+                if self._pause_evt.is_set():
+                    self._proc.send_signal(signal.SIGSTOP)
+                    self.state = "paused"
+                    self._pause_ts = time.time()
+                    while self._pause_evt.is_set() and not self._stop_evt.is_set():
+                        time.sleep(0.1)
+                    if not self._stop_evt.is_set():
+                        self._paused_total += time.time() - self._pause_ts
+                        self._proc.send_signal(signal.SIGCONT)
+                        self.state = "playing"
+                else:
+                    elapsed = time.time() - self.play_start_ts - self._paused_total
+                    self.est_char_pos = min(int(elapsed * self._chars_per_sec),
+                                           self.chapter_len)
+                time.sleep(0.2)
+        except Exception as e:
+            self.state = "error"; self.error_msg = str(e)
+            log.exception("ffplay cached error")
+            return
+
+        if not self._stop_evt.is_set():
+            self.state = "done"
+            log.debug("cached chapter done")
+            if self.on_done:
+                self.on_done()
+
     def _cleanup(self, tmpdir):
         try: shutil.rmtree(tmpdir, ignore_errors=True)
         except: pass
+
+
+# ─── Preload cache ────────────────────────────────────────────────────────────
+
+CACHE_DIR    = CONFIG_DIR / "cache"
+PRELOAD_AHEAD = 2   # how many chapters ahead to pre-synthesize
+
+class PreloadCache:
+    """
+    Pre-synthesizes the next PRELOAD_AHEAD chapters in background threads.
+    Cache entries live on disk at CACHE_DIR/<key>/ and survive between
+    engine/voice/speed changes only when the key still matches.
+
+    Key format:  {ch_idx}_{engine}_{voice}_{speed:.3f}
+    Each entry contains:
+        chunk_NNNN.{ext}  — audio files
+        playlist.txt      — ffplay concat playlist
+        .done             — sentinel written last (entry only usable when present)
+    """
+
+    def __init__(self):
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self._lock     = threading.Lock()
+        self._workers: Dict[int, threading.Thread] = {}   # ch_idx → thread
+        self._cancel:  Dict[int, threading.Event]  = {}   # ch_idx → stop event
+        # Clean up stale cache entries from previous sessions on startup
+        self._gc()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def key(self, ch_idx: int, engine: str, voice: str, speed: float) -> str:
+        safe_voice = re.sub(r'[^\w.-]', '_', voice)
+        safe_eng   = re.sub(r'[^\w.-]', '_', engine)
+        return f"{ch_idx}_{safe_eng}_{safe_voice}_{speed:.3f}"
+
+    def warm(self, ch_idx: int, engine: str, voice: str, speed: float) -> bool:
+        """Return True if a complete cached entry exists for this chapter."""
+        entry = CACHE_DIR / self.key(ch_idx, engine, voice, speed)
+        return (entry / ".done").exists()
+
+    def get_playlist(self, ch_idx: int, engine: str, voice: str, speed: float) -> Optional[str]:
+        """Return path to playlist.txt if cache is warm, else None."""
+        entry = CACHE_DIR / self.key(ch_idx, engine, voice, speed)
+        pl    = entry / "playlist.txt"
+        if (entry / ".done").exists() and pl.exists():
+            return str(pl)
+        return None
+
+    def prime(self, chapters: list, from_idx: int,
+              engine: str, voice: str, speed: float):
+        """
+        Kick off background synthesis for the next PRELOAD_AHEAD chapters
+        starting at from_idx.  Already-warm or already-running entries are
+        skipped.  Entries for chapters we no longer need are cancelled.
+        """
+        wanted = set()
+        for offset in range(1, PRELOAD_AHEAD + 1):
+            ci = from_idx + offset
+            if ci < len(chapters):
+                wanted.add(ci)
+
+        with self._lock:
+            # Cancel workers we no longer need
+            for ci in list(self._workers.keys()):
+                if ci not in wanted:
+                    evt = self._cancel.get(ci)
+                    if evt:
+                        evt.set()
+                    self._workers.pop(ci, None)
+                    self._cancel.pop(ci, None)
+
+            # Start workers for wanted chapters not yet warm or running
+            for ci in wanted:
+                if self.warm(ci, engine, voice, speed):
+                    continue
+                if ci in self._workers and self._workers[ci].is_alive():
+                    continue
+                _, text = chapters[ci]
+                evt = threading.Event()
+                self._cancel[ci] = evt
+                t = threading.Thread(
+                    target=self._synthesize,
+                    args=(ci, text, engine, voice, speed, evt),
+                    daemon=True)
+                self._workers[ci] = t
+                t.start()
+                log.debug("preload: queued ch=%d engine=%s voice=%s", ci, engine, voice)
+
+    def invalidate(self):
+        """Cancel all running workers and wipe the cache directory."""
+        with self._lock:
+            for evt in self._cancel.values():
+                evt.set()
+            self._workers.clear()
+            self._cancel.clear()
+        try:
+            shutil.rmtree(str(CACHE_DIR), ignore_errors=True)
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            log.debug("preload: cache invalidated")
+        except Exception as e:
+            log.warning("preload: invalidate error: %s", e)
+
+    def invalidate_chapter(self, ch_idx: int):
+        """Cancel and remove a single chapter's cache entry."""
+        with self._lock:
+            evt = self._cancel.pop(ch_idx, None)
+            if evt:
+                evt.set()
+            self._workers.pop(ch_idx, None)
+        # Remove all keys that start with this chapter index
+        prefix = f"{ch_idx}_"
+        try:
+            for entry in CACHE_DIR.iterdir():
+                if entry.name.startswith(prefix):
+                    shutil.rmtree(str(entry), ignore_errors=True)
+        except Exception:
+            pass
+
+    def status(self, ch_idx: int, engine: str, voice: str, speed: float) -> str:
+        """Return 'warm'|'loading'|'idle' for debug display."""
+        if self.warm(ch_idx, engine, voice, speed):
+            return "warm"
+        with self._lock:
+            t = self._workers.get(ch_idx)
+            if t and t.is_alive():
+                return "loading"
+        return "idle"
+
+    # ── Background worker ─────────────────────────────────────────────────────
+
+    def _synthesize(self, ch_idx: int, text: str, engine: str,
+                    voice: str, speed: float, cancel: threading.Event):
+        mgr   = get_manager()
+        k     = self.key(ch_idx, engine, voice, speed)
+        entry = CACHE_DIR / k
+        done  = entry / ".done"
+
+        # Another process may have already written this entry
+        if done.exists():
+            log.debug("preload: ch=%d already warm, skipping", ch_idx)
+            return
+
+        # Use a tmp subdir then rename to avoid partial reads
+        tmp_entry = CACHE_DIR / (k + ".tmp")
+        try:
+            shutil.rmtree(str(tmp_entry), ignore_errors=True)
+            tmp_entry.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log.warning("preload: mkdir failed ch=%d: %s", ch_idx, e)
+            return
+
+        chunks = split_text(text)
+        ext    = mgr.output_ext(engine)
+        audio_files = []
+
+        for i, chunk in enumerate(chunks):
+            if cancel.is_set():
+                shutil.rmtree(str(tmp_entry), ignore_errors=True)
+                log.debug("preload: ch=%d cancelled at chunk %d", ch_idx, i)
+                return
+            outfile = str(tmp_entry / f"chunk_{i:04d}{ext}")
+            ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
+            if not ok or not os.path.exists(outfile):
+                shutil.rmtree(str(tmp_entry), ignore_errors=True)
+                log.warning("preload: ch=%d synthesis failed chunk %d", ch_idx, i)
+                return
+            audio_files.append(outfile)
+            log.debug("preload: ch=%d chunk %d/%d done", ch_idx, i+1, len(chunks))
+
+        if cancel.is_set():
+            shutil.rmtree(str(tmp_entry), ignore_errors=True)
+            return
+
+        # Write playlist using final paths (after rename)
+        final_audio = [str(entry / Path(af).name) for af in audio_files]
+        pl_path = tmp_entry / "playlist.txt"
+        with open(pl_path, "w") as f:
+            for af in final_audio:
+                f.write(f"file '{af}'\n")
+
+        # Atomic rename tmp → final
+        try:
+            if entry.exists():
+                shutil.rmtree(str(entry), ignore_errors=True)
+            tmp_entry.rename(entry)
+            (entry / ".done").touch()
+            log.info("preload: ch=%d warm (%d chunks, engine=%s)", ch_idx, len(chunks), engine)
+        except Exception as e:
+            log.warning("preload: rename failed ch=%d: %s", ch_idx, e)
+            shutil.rmtree(str(tmp_entry), ignore_errors=True)
+
+    def _gc(self):
+        """Remove cache entries older than 2 hours to avoid stale disk use."""
+        cutoff = time.time() - 7200
+        try:
+            for entry in CACHE_DIR.iterdir():
+                if entry.is_dir():
+                    try:
+                        if entry.stat().st_mtime < cutoff:
+                            shutil.rmtree(str(entry), ignore_errors=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 # ─── TUI ──────────────────────────────────────────────────────────────────────
@@ -818,6 +1085,7 @@ class TUI:
         self.cfg.setdefault("bookmarks", {}).setdefault(self._bm_key, [])
         self.cfg.setdefault("engine", "edge-tts")
         self._mgr         = get_manager()
+        self._preload     = PreloadCache()
         self._setup_colors()
         log.info("TUI init: %s  %d chapters  engine=%s",
                  self.filename, len(chapters), cfg.get("engine"))
@@ -871,7 +1139,18 @@ class TUI:
         speed  = SPEEDS[self.cfg["speed_index"]]
         _, text = self.chapters[self.ch_idx]
         log.info("play ch=%d engine=%s voice=%s speed=%s", self.ch_idx, engine, voice, speed)
-        self.player.play(text, voice, speed, engine)
+
+        pl = self._preload.get_playlist(self.ch_idx, engine, voice, speed)
+        if pl:
+            log.info("preload: cache HIT ch=%d", self.ch_idx)
+            self.player.play_cached(pl, str(CACHE_DIR / self._preload.key(
+                self.ch_idx, engine, voice, speed)), len(text), speed)
+        else:
+            log.info("preload: cache MISS ch=%d — synthesizing live", self.ch_idx)
+            self.player.play(text, voice, speed, engine)
+
+        # Prime the next PRELOAD_AHEAD chapters in background
+        self._preload.prime(self.chapters, self.ch_idx, engine, voice, speed)
 
     # ── Text helpers ──────────────────────────────────────────────────────────
 
@@ -1051,6 +1330,12 @@ class TUI:
             disp     = title[:maxw] + "…" if len(title) > maxw else title
             bmark    = "♥" if is_bm else " "
 
+            engine = self.cfg.get("engine", "edge-tts")
+            voice  = current_voice_id(self.cfg)
+            speed  = SPEEDS[self.cfg["speed_index"]]
+            is_warm = (idx != self.ch_idx
+                       and self._preload.warm(idx, engine, voice, speed))
+
             if idx == self.ch_idx and self.player.state in ("playing","loading","paused","generating"):
                 icon = STATE_ICONS.get(self.player.state, "▶")
                 if self.player.state == "generating":
@@ -1063,6 +1348,9 @@ class TUI:
             elif idx == self.ch_idx:
                 line = f"{bmark}› {disp}"
                 attr = self._cp("accent", bold=True)
+            elif is_warm:
+                line = f"{bmark}⚡ {disp[:width-5]}"
+                attr = self._cp("ok")
             else:
                 line = f"{bmark}{idx+1:>3}. {disp[:width-7]}"
                 attr = self._cp("bm") if is_bm else self._cp("normal")
@@ -1117,13 +1405,13 @@ class TUI:
     def _draw_rp_voices(self, left, width, top, height):
         focused = self.focus == "rpanel"
 
-        # Clear panel area with terminal-transparent background
+        # Background fill
         for r in range(height):
-            self._sa(top+r, left, " "*width, self._cp("normal"))
+            self._sa(top+r, left, " "*width, self._cp("rpanel"))
 
         # ── Header ───────────────────────────────────────────────────────────
         label = " ENGINES & VOICES" + (" ←" if focused else "")
-        self._sa(top,   left, label,            self._cp("accent", bold=True))
+        self._sa(top,   left, label,            self._cp("rpanel", bold=True))
         self._sa(top,   left+width-3, "Esc",   self._cp("dim"))
         self._sa(top+1, left, BOX["h"]*width,   self._cp("accent"))
 
@@ -1200,7 +1488,7 @@ class TUI:
                 elif vidx == cur_vidx and eng_for_voices == active_engine:
                     self._sa(y, left, line[:width], self._cp("ok", bold=True))
                 else:
-                    self._sa(y, left, line[:width], self._cp("normal"))
+                    self._sa(y, left, line[:width], self._cp("rpanel"))
 
         # Hint line
         hint = " ↑↓:nav  Tab:section  Enter:pick"
@@ -1210,14 +1498,14 @@ class TUI:
 
     def _draw_rp_bookmarks(self, left, width, top, height):
         focused = self.focus == "rpanel"
+        hattr   = self._cp("rpanel", bold=True)
         bms     = self.cfg["bookmarks"].get(self._bm_key, [])
-        # Clear panel area with terminal-transparent background
         for r in range(height):
-            self._sa(top+r, left, " "*width, self._cp("normal"))
+            self._sa(top+r, left, " "*width, self._cp("rpanel"))
         label = f" BOOKMARKS ({len(bms)})"
         if focused:
             label += " ←"
-        self._sa(top,   left, label,         self._cp("accent", bold=True))
+        self._sa(top,   left, label,         hattr)
         self._sa(top,   left+width-3, "Esc", self._cp("dim"))
         self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
 
@@ -1372,15 +1660,24 @@ class TUI:
         self._sa(dy, dx+2, " DEBUG  (? to close) ", self._cp("playing", bold=True))
 
         eng_avail = {k: v for k, v in self._mgr.availability.items()}
+        engine = self.cfg.get('engine', 'edge-tts')
+        voice  = current_voice_id(self.cfg)
+        speed  = SPEEDS[self.cfg['speed_index']]
+        pl_status = "  ".join(
+            f"ch{self.ch_idx+1+i}:{self._preload.status(self.ch_idx+i, engine, voice, speed)}"
+            for i in range(1, PRELOAD_AHEAD+1)
+            if self.ch_idx+i < len(self.chapters)
+        )
         rows = [
             f"  File       : {self.filename}",
             f"  Chapter    : {self.ch_idx+1}/{len(self.chapters)}  scroll={self.view_scroll}",
             f"  Player     : state={p.state}  chunk={p.chunk_idx}/{p.total_chunks}",
             f"  Playback   : est_pos={p.est_char_pos}  ch_len={p.chapter_len}  cps={p._chars_per_sec:.1f}",
             f"  Paused     : total_paused={p._paused_total:.1f}s",
-            f"  Engine     : {self.cfg.get('engine','edge-tts')}  voice={current_voice_id(self.cfg)}",
+            f"  Engine     : {engine}  voice={voice}",
             f"  Availability: {eng_avail}",
-            f"  Config     : speed={SPEEDS[self.cfg['speed_index']]}×  "
+            f"  Preload    : {pl_status or 'n/a'}",
+            f"  Config     : speed={speed}×  "
                            f"align={self.cfg.get('align')}  "
                            f"zoom={self.cfg.get('zoom')}  "
                            f"theme={self.cfg.get('theme')}",
@@ -1460,6 +1757,7 @@ class TUI:
                 return
 
         if key in (ord('q'), ord('Q')):
+            self._preload.invalidate()
             self.player.stop(); self.running = False; return
 
         if key == ord('?'):
@@ -1537,6 +1835,7 @@ class TUI:
             was = self.player.state in ("playing","paused","loading","generating")
             self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
             save_config(self.cfg)
+            self._preload.invalidate()
             if was: self.player.stop(); self._play()
             return
 
@@ -1620,6 +1919,7 @@ class TUI:
                         self._voice_sel         = 0
                         self.rp_scroll          = 0
                         save_config(self.cfg)
+                        self._preload.invalidate()
                         log.info("engine changed to %s", eng)
                         if was: self.player.stop(); self._play()
                     return True
@@ -1640,6 +1940,7 @@ class TUI:
                         self.cfg["engine"]      = eng_for_voices
                         self.cfg["voice_index"] = self._voice_sel
                         save_config(self.cfg)
+                        self._preload.invalidate()
                         log.info("voice changed: engine=%s voice=%s",
                                  eng_for_voices, voices[self._voice_sel][0])
                         if was: self.player.stop(); self._play()
