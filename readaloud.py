@@ -59,11 +59,39 @@ class EdgeTTSBackend(BaseTTSBackend):
 
 class KokoroBackend(BaseTTSBackend):
     """Kokoro offline TTS — fast, high-quality CPU inference.
-    Supports both 'kokoro' (native, Python <3.13) and 'pykokoro'
-    (pure-Python ONNX wrapper, Python 3.13+).
+    Tries in order:
+      1. native 'kokoro' (hexgrad, KPipeline) — requires Python <3.13
+      2. 'pykokoro' (pure-Python ONNX, no version cap) — build_pipeline API
+      3. CLI fallback
+    Pipeline is cached per (voice, speed) so ONNX loads once per session.
+    last_error is set on failure so callers can surface the real message.
     """
+    def __init__(self):
+        self.last_error = ""
+        self._pykokoro_pipeline = None   # cached pykokoro pipeline
+        self._pykokoro_key      = None   # (voice, speed) key for cache
+
+    def _get_pykokoro_pipeline(self, voice: str, speed: float):
+        """Return a cached pykokoro pipeline, rebuilding only when voice/speed changes."""
+        key = (voice, speed)
+        if self._pykokoro_pipeline is not None and self._pykokoro_key == key:
+            return self._pykokoro_pipeline
+        from pykokoro import build_pipeline, PipelineConfig, GenerationConfig
+        cfg = PipelineConfig(
+            voice=voice,
+            generation=GenerationConfig(speed=speed),
+        )
+        pipeline = build_pipeline(config=cfg, eager=True)
+        self._pykokoro_pipeline = pipeline
+        self._pykokoro_key      = key
+        log.info("pykokoro: pipeline built for voice=%s speed=%s", voice, speed)
+        return pipeline
+
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
-        # Try native kokoro library first (Python <3.13)
+        import traceback as _tb
+        self.last_error = ""
+
+        # 1. Native kokoro (Python <3.13)
         try:
             from kokoro import KPipeline
             import soundfile as sf
@@ -73,32 +101,39 @@ class KokoroBackend(BaseTTSBackend):
             for _, _, audio in generator:
                 sf.write(output_path, audio, 24000)
                 return True
+            self.last_error = "kokoro: generator produced no audio"
             return False
         except ImportError:
             log.debug("kokoro not available, trying pykokoro")
         except Exception as e:
-            log.debug("kokoro error: %s", e)
+            self.last_error = f"kokoro: {type(e).__name__}: {e}"
+            log.error("kokoro (native) error:\n%s", _tb.format_exc())
+            return False
 
-        # pykokoro fallback (pure-Python ONNX, works on Python 3.13+)
+        # 2. pykokoro — cached pipeline (ONNX loads once per voice/speed)
         try:
-            import pykokoro
-            import soundfile as sf
-            pipeline  = pykokoro.Pipeline(voice=voice, speed=speed)
-            audio     = pipeline(text)
-            sf.write(output_path, audio, 24000)
+            pipeline = self._get_pykokoro_pipeline(voice, speed)
+            result   = pipeline(text)
+            result.save_wav(output_path)
             return True
         except ImportError:
             log.debug("pykokoro not available, trying CLI")
         except Exception as e:
-            log.debug("pykokoro error: %s", e)
+            self.last_error = f"pykokoro: {type(e).__name__}: {e}"
+            log.error("pykokoro error:\n%s", _tb.format_exc())
+            # Invalidate cache on error so next call retries fresh
+            self._pykokoro_pipeline = None
+            self._pykokoro_key      = None
+            return False
 
-        # Last resort: CLI
+        # 3. CLI last resort
         try:
             subprocess.run(
                 ["kokoro", "--voice", voice, "--text", text, "--output", output_path],
                 check=True, capture_output=True, timeout=120)
             return True
         except Exception as e:
+            self.last_error = f"kokoro CLI: {type(e).__name__}: {e}"
             log.error("Kokoro CLI error: %s", e)
             return False
 
@@ -438,7 +473,7 @@ THEMES = {
             "hl":      (curses.COLOR_BLACK,    curses.COLOR_YELLOW),
             "bm":      (curses.COLOR_BLACK,    curses.COLOR_GREEN),
             "btn":     (curses.COLOR_BLACK,    curses.COLOR_CYAN),
-            "rpanel":  (curses.COLOR_WHITE,    curses.COLOR_BLUE),
+            "rpanel":  (curses.COLOR_WHITE,    -1),
             "offline": (curses.COLOR_GREEN,   -1),
             "online":  (curses.COLOR_CYAN,    -1),
         },
@@ -687,7 +722,9 @@ class Player:
             ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
             if not ok:
                 self.state = "error"
-                self.error_msg = f"{engine}: synthesis failed on chunk {i+1}"
+                backend = mgr._backends.get(engine)
+                detail = getattr(backend, "last_error", "") or f"synthesis failed on chunk {i+1}"
+                self.error_msg = f"{engine}: {detail}"
                 log.error(self.error_msg)
                 self._cleanup(tmpdir); return
             if not os.path.exists(outfile):
@@ -1405,10 +1442,6 @@ class TUI:
     def _draw_rp_voices(self, left, width, top, height):
         focused = self.focus == "rpanel"
 
-        # Background fill
-        for r in range(height):
-            self._sa(top+r, left, " "*width, self._cp("rpanel"))
-
         # ── Header ───────────────────────────────────────────────────────────
         label = " ENGINES & VOICES" + (" ←" if focused else "")
         self._sa(top,   left, label,            self._cp("rpanel", bold=True))
@@ -1488,7 +1521,7 @@ class TUI:
                 elif vidx == cur_vidx and eng_for_voices == active_engine:
                     self._sa(y, left, line[:width], self._cp("ok", bold=True))
                 else:
-                    self._sa(y, left, line[:width], self._cp("rpanel"))
+                    self._sa(y, left, line[:width], self._cp("normal"))
 
         # Hint line
         hint = " ↑↓:nav  Tab:section  Enter:pick"
@@ -1498,10 +1531,8 @@ class TUI:
 
     def _draw_rp_bookmarks(self, left, width, top, height):
         focused = self.focus == "rpanel"
-        hattr   = self._cp("rpanel", bold=True)
+        hattr   = self._cp("accent", bold=True)
         bms     = self.cfg["bookmarks"].get(self._bm_key, [])
-        for r in range(height):
-            self._sa(top+r, left, " "*width, self._cp("rpanel"))
         label = f" BOOKMARKS ({len(bms)})"
         if focused:
             label += " ←"
@@ -1650,8 +1681,6 @@ class TUI:
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
-        for r in range(dh):
-            self._sa(dy+r, dx, " "*dw, self._cp("hdr"))
         self._sa(dy,      dx, BOX["tl"]+BOX["h"]*(dw-2)+BOX["tr"], self._cp("playing", bold=True))
         self._sa(dy+dh-1, dx, BOX["bl"]+BOX["h"]*(dw-2)+BOX["br"], self._cp("playing", bold=True))
         for r in range(1, dh-1):
