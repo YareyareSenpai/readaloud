@@ -71,11 +71,15 @@ Everything else (Python packages, engine binaries) is handled automatically by `
 | Engine | What gets installed |
 |--------|---------------------|
 | **Edge TTS** | `edge-tts` package in venv; invoked via `pipx run` |
-| **Kokoro** | `kokoro`, `soundfile`, `onnxruntime` in venv |
+| **Kokoro** | `pykokoro` + `onnxruntime` + spaCy `en_core_web_sm` in venv (falls back to native `kokoro` on Python <3.13); ONNX model weights (~800 MB) downloaded from HuggingFace on first use |
 | **Piper** | `piper-tts` in venv; binary symlinked to `~/.local/bin/piper` |
 | **F5-TTS** | `f5-tts` in venv (skipped gracefully if torch/CUDA missing); binary symlinked to `~/.local/bin/f5-tts_infer-cli` |
 
 ### What you must provide manually (post-install)
+
+**Kokoro** works out of the box after `install.sh`, but on first use it downloads ~800 MB of ONNX model weights from HuggingFace into `~/.cache/pykokoro/`. This happens automatically in the background — expect a 30–60 second delay before the first chapter starts playing. Subsequent chapters and sessions are instant.
+
+On **Python 3.13+** the installer uses `pykokoro` (pure-Python ONNX wrapper) instead of the native `kokoro` package. The voices and quality are identical. The `install.sh` handles the correct variant automatically.
 
 **Piper** requires model files — the binary alone is not enough:
 
@@ -304,6 +308,8 @@ Cycle with `t`. 256-colour terminals get full palette control; 8-colour terminal
 
 ### Kokoro (offline)
 
+The 7 voices below are the curated default set shown in the voices panel. The full `pykokoro` library ships 54 voices — additional voices (e.g. `af_bella`, `af_sarah`, `am_echo`, `bm_daniel`, multilingual) can be used by editing `KOKORO_VOICES` in `readaloud.py` or selecting them via the voices panel once available.
+
 | Name | Region | Gender |
 |------|--------|--------|
 | af_heart | US | ♀ |
@@ -377,7 +383,7 @@ Debug logs: `~/.config/readaloud/debug.log`
 
 1. **Parsing** — `ebooklib` reads the EPUB spine and extracts plain text per chapter via a custom HTML stripper. TXT files split by heading patterns or blank lines.
 2. **Engine scan** — at startup, `SystemScanner` checks for binary commands (`piper`, `f5-tts_infer-cli`, `ffplay`) and Python imports (`kokoro`, `piper`, `f5_tts`, `edge_tts`) to build an availability map. Unavailable engines are shown greyed out in the voices panel.
-3. **TTS** — chapter text is split into ≤4500-char chunks at sentence boundaries, each synthesised by the active backend: Edge TTS writes MP3 via `pipx run edge-tts`; Kokoro uses its Python library or CLI; Piper pipes stdin to its binary with an ONNX model; F5-TTS calls `f5-tts_infer-cli` with `ref.wav`.
+3. **TTS** — chapter text is split into ≤4500-char chunks at sentence boundaries, each synthesised by the active backend: Edge TTS writes MP3 via `pipx run edge-tts`; Kokoro uses `pykokoro` (Python 3.13+) or native `kokoro` (<3.13) with a cached ONNX session — the pipeline is built once per voice/speed pair and reused across chunks; Piper pipes stdin to its binary with an ONNX model; F5-TTS calls `f5-tts_infer-cli` with `ref.wav`.
 4. **Playback** — `ffplay` plays all chunks as a concat playlist with an `atempo` filter for speed control. Pause/resume via `SIGSTOP`/`SIGCONT` on the ffplay process. WAV and MP3 chunks are handled identically by the concat pipeline.
 5. **Highlight** — a background thread tracks elapsed time against estimated chars/second (140 wpm × speed × 5 chars/word) to approximate the current reading position.
 
@@ -403,9 +409,25 @@ sudo pacman -S ffmpeg
 ```
 
 **Kokoro not detected**
+
+On Python <3.13:
 ```bash
-~/.local/share/readaloud/venv/bin/pip install "kokoro>=0.9.4" soundfile
+~/.local/share/readaloud/venv/bin/pip install "kokoro>=0.9.4" soundfile onnxruntime
 ```
+On Python 3.13+:
+```bash
+~/.local/share/readaloud/venv/bin/pip install pykokoro
+~/.local/share/readaloud/venv/bin/python -m spacy download en_core_web_sm
+```
+
+**Kokoro detected but synthesis fails (spaCy model missing)**
+```bash
+~/.local/share/readaloud/venv/bin/python -m spacy download en_core_web_sm
+```
+
+**Kokoro first run is very slow (30–60 s delay)**
+
+Expected — it is downloading ~800 MB of ONNX model weights from HuggingFace on first use. Subsequent runs are instant. Check `~/.config/readaloud/debug.log` to watch progress.
 
 **Piper model not found**
 ```
@@ -429,6 +451,20 @@ ebook-convert book.epub book.txt
 ## Why Not SpeakUB?
 
 SpeakUB's Edge-TTS integration hardcodes `pygame.mixer` for audio output, which fails on Arch Linux with PipeWire. The `tts_backend: mpv` config override isn't actually wired up. `readaloud` owns the full pipeline — TTS generation straight to `ffplay`, no intermediate audio framework — and adds offline engine support on top.
+
+---
+
+## Chapter Preloading
+
+readaloud pre-synthesises the next 2 chapters in background threads while the current one plays, so pressing `n` starts audio immediately with no loading delay. Pre-warmed chapters are marked with `⚡` in the chapter nav. The cache lives at `~/.config/readaloud/cache/` and is keyed by chapter, engine, voice, and speed — it invalidates automatically when any of those change. Entries older than 2 hours are cleaned up on startup.
+
+---
+
+## Support
+
+If readaloud is useful to you, consider buying me a coffee — it keeps the project going.
+
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/kamquat)
 
 ---
 
