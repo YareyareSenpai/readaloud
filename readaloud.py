@@ -5,6 +5,11 @@ Backends: edge-tts (online), kokoro, piper, f5-tts (offline)
 Deps: ebooklib (pip), edge-tts (pipx), ffplay (ffmpeg)
 Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
+
+Reading Scenarios (auto-selected by panel visibility):
+  Scenario 1 — neither panel visible   → 1 bordered reading column
+  Scenario 2 — exactly one panel       → 2 snake-flow columns
+  Scenario 3 — both panels visible     → 3 snake-flow columns
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
@@ -1123,6 +1128,8 @@ class TUI:
         self.cfg.setdefault("engine", "edge-tts")
         self._mgr         = get_manager()
         self._preload     = PreloadCache()
+        # Multi-page snake scroll: total line offset across all columns
+        self._snake_scroll = 0
         self._setup_colors()
         log.info("TUI init: %s  %d chapters  engine=%s",
                  self.filename, len(chapters), cfg.get("engine"))
@@ -1193,6 +1200,7 @@ class TUI:
 
     def _invalidate(self):
         self._t_ch = -1
+        self._snake_scroll = 0
 
     def _get_lines(self, width):
         align = self.cfg.get("align", "left")
@@ -1205,6 +1213,7 @@ class TUI:
             self._t_align = align
             self._t_width = width
             self.view_scroll = 0
+            self._snake_scroll = 0
         return self._tlines
 
     def _char_to_line(self, pos, lines):
@@ -1214,6 +1223,22 @@ class TUI:
             if total >= pos:
                 return i
         return len(lines) - 1
+
+    # ── Reading scenario detection ────────────────────────────────────────────
+
+    def _reading_scenario(self) -> int:
+        """
+        1 → neither panel visible  (1 bordered column)
+        2 → exactly one panel      (2 snake columns)
+        3 → both panels visible    (3 snake columns)
+        """
+        panels = (1 if self.nav_visible else 0) + (1 if self.rpanel else 0)
+        if panels == 0:
+            return 1
+        elif panels == 1:
+            return 2
+        else:
+            return 3
 
     # ── Layout geometry ───────────────────────────────────────────────────────
 
@@ -1260,13 +1285,23 @@ class TUI:
             self.scr.refresh(); return
 
         nav_w, tl, tw, rpl, rpw, hh, fh, ch = self._layout(H, W)
+        scenario = self._reading_scenario()
 
         self._draw_header(W)
+
         if self.nav_visible:
             self._draw_nav(nav_w, hh, ch)
             for r in range(ch):
                 self._sa(hh+r, nav_w, BOX["v"], self._cp("accent"))
-        self._draw_text(tl, tw, hh, ch)
+
+        # Route to correct reading scenario renderer
+        if scenario == 1:
+            self._draw_text_scenario1(tl, tw, hh, ch)
+        elif scenario == 2:
+            self._draw_text_scenario2(tl, tw, hh, ch, W)
+        else:
+            self._draw_text_scenario3(tl, tw, hh, ch, W)
+
         if self.rpanel:
             for r in range(ch):
                 self._sa(hh+r, rpl-1, BOX["v"], self._cp("accent"))
@@ -1274,6 +1309,7 @@ class TUI:
                 self._draw_rp_voices(rpl, rpw, hh, ch)
             elif self.rpanel == "bookmarks":
                 self._draw_rp_bookmarks(rpl, rpw, hh, ch)
+
         self._draw_footer(W, H, fh)
         self._draw_float_btns(W, H, fh)
         if self._debug:
@@ -1330,6 +1366,7 @@ class TUI:
         auto = "AUTO↓" if self._autoscroll else "─────"
         hl_l = "HL" if self._highlight else "hl"
         dbg  = " DBG" if self._debug else ""
+        scn  = f" S{self._reading_scenario()}"
         if state == "generating":
             state_lbl = self.player.anim_frame
         else:
@@ -1339,7 +1376,7 @@ class TUI:
                f"  Speed:{speed:.2f}×"
                f"  Align:{albl:<6}"
                f"  Z{zi+1}/{len(ZOOM_LEVELS)}"
-               f"  {auto}  {hl_l}{dbg}")
+               f"  {auto}  {hl_l}{dbg}{scn}")
         self._sa(2, 0, sub, sc)
 
     # ── Left nav (chapters) ───────────────────────────────────────────────────
@@ -1394,19 +1431,51 @@ class TUI:
 
             self._sa(y, 0, line[:width-1], attr)
 
-    # ── Text area ─────────────────────────────────────────────────────────────
+    # ── SCENARIO 1: Single bordered reading column ────────────────────────────
+    # Triggered when NEITHER nav nor rpanel is visible.
+    # Draws a rounded box around the entire text area with symmetric padding.
 
-    def _draw_text(self, left, width, top, height):
+    def _draw_text_scenario1(self, left: int, width: int, top: int, height: int):
+        """1-page: bordered reading box, symmetric padding, full content area."""
         if width < 8: return
-        ch_title, _ = self.chapters[self.ch_idx]
-        self._sa(top, left, f" ── {ch_title} "[:width-1], self._cp("accent", bold=True))
 
         zm     = ZOOM_LEVELS[self.cfg.get("zoom", ZOOM_DEFAULT)]
-        el     = left + zm
-        ew     = max(8, width - zm * 2)
-        lines  = self._get_lines(ew)
-        vis    = height - 1
-        maxs   = max(0, len(lines) - vis)
+        # Inner margins: horizontal zoom padding + 2 for box border
+        pad_x  = zm + 2
+        pad_y  = 1
+        box_x  = left + zm
+        box_w  = max(8, width - zm * 2)
+        box_h  = height
+
+        # Draw rounded border
+        ac = self._cp("accent", bold=True)
+        # Top border with chapter title
+        ch_title, _ = self.chapters[self.ch_idx]
+        title_str = f" {ch_title} "
+        border_top = BOX["tl"] + BOX["h"] * (box_w - 2) + BOX["tr"]
+        # Embed title in top border
+        if len(title_str) < box_w - 4:
+            mid = (box_w - len(title_str)) // 2
+            border_top = (BOX["tl"] + BOX["h"] * (mid - 1) +
+                          title_str +
+                          BOX["h"] * (box_w - 2 - mid - len(title_str) + 1) +
+                          BOX["tr"])
+        self._sa(top,          box_x, border_top[:box_w],  ac)
+        self._sa(top + box_h - 1, box_x,
+                 BOX["bl"] + BOX["h"] * (box_w - 2) + BOX["br"], ac)
+        for r in range(1, box_h - 1):
+            self._sa(top + r, box_x,           BOX["v"], ac)
+            self._sa(top + r, box_x + box_w - 1, BOX["v"], ac)
+
+        # Inner text area
+        inner_x = box_x + pad_x
+        inner_w = max(4, box_w - pad_x * 2)
+        inner_h = box_h - 2   # minus top and bottom border rows
+        inner_top = top + pad_y + 1  # +1 for top border row
+
+        lines = self._get_lines(inner_w)
+        vis   = inner_h - pad_y  # leave bottom padding
+        maxs  = max(0, len(lines) - vis)
         self.view_scroll = min(self.view_scroll, maxs)
 
         hl = -1
@@ -1421,21 +1490,170 @@ class TUI:
 
         for row in range(vis):
             lidx = self.view_scroll + row
-            y    = top + 1 + row
+            y    = inner_top + row
+            if y >= top + box_h - 1: break
             if lidx >= len(lines): break
             line = lines[lidx]
             if not line: continue
             is_head = (lidx == 0 or (lidx > 0 and not lines[lidx-1].strip()))
             if lidx == hl:
-                self._sa(y, el+1, line.ljust(ew-2)[:ew-2], self._cp("hl", bold=True))
+                self._sa(y, inner_x, line.ljust(inner_w)[:inner_w], self._cp("hl", bold=True))
             elif is_head:
-                self._sa(y, el+1, line[:ew-2], self._cp("accent", bold=True))
+                self._sa(y, inner_x, line[:inner_w], self._cp("accent", bold=True))
             else:
-                self._sa(y, el+1, line[:ew-2], self._cp("normal"))
+                self._sa(y, inner_x, line[:inner_w], self._cp("normal"))
 
-        if len(lines) > vis and width > 8:
+        # Scroll % in bottom-right of box
+        if len(lines) > vis:
             pct = int(self.view_scroll / max(1, maxs) * 100)
-            self._sa(top+1, left+width-6, f"{pct:3d}%", self._cp("dim"))
+            self._sa(top + box_h - 1, box_x + box_w - 6,
+                     f"{pct:3d}%", self._cp("dim"))
+
+    # ── SCENARIO 2: Two snake-flow columns ────────────────────────────────────
+    # Triggered when exactly ONE panel is visible.
+    # Text fills left column then continues in right column (snake-flow).
+
+    def _draw_text_scenario2(self, left: int, width: int, top: int, height: int, W: int):
+        """2-page snake layout: text flows left col → right col."""
+        if width < 16: return
+
+        zm     = ZOOM_LEVELS[self.cfg.get("zoom", ZOOM_DEFAULT)]
+        # Divider in the centre of the text area
+        col_w  = (width - 1) // 2   # each column width (1 col for divider)
+        col_pad = max(0, zm)
+        inner_w = max(4, col_w - col_pad * 2 - 1)
+
+        col1_x = left + col_pad
+        col2_x = left + col_w + 1 + col_pad
+        div_x  = left + col_w
+
+        lines = self._get_lines(inner_w)
+        vis_rows = height - 1   # one row for chapter title at top
+
+        # Draw divider
+        ch_title, _ = self.chapters[self.ch_idx]
+        self._sa(top, left, f" ── {ch_title} "[:width-1], self._cp("accent", bold=True))
+        for r in range(vis_rows):
+            self._sa(top + 1 + r, div_x, BOX["v"], self._cp("accent"))
+
+        # Column headers
+        self._sa(top, col1_x, "① ", self._cp("dim"))
+        self._sa(top, col2_x, "② ", self._cp("dim"))
+
+        total_vis  = vis_rows * 2   # total visible lines across both columns
+        maxs       = max(0, len(lines) - total_vis)
+        self._snake_scroll = min(self._snake_scroll, maxs)
+
+        hl = -1
+        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
+            hl = self._char_to_line(self.player.est_char_pos, lines)
+            # Autoscroll: keep hl visible across the combined 2-column view
+            if self._autoscroll:
+                mg = 3
+                # Absolute position of hl in snake flow
+                if hl < self._snake_scroll + mg:
+                    self._snake_scroll = max(0, hl - mg)
+                elif hl >= self._snake_scroll + total_vis - mg:
+                    self._snake_scroll = min(maxs, hl - total_vis + mg + 1)
+
+        self._render_snake_columns(
+            lines, top + 1, vis_rows,
+            [(col1_x, inner_w), (col2_x, inner_w)],
+            self._snake_scroll, hl
+        )
+
+        # Scroll %
+        if len(lines) > total_vis:
+            pct = int(self._snake_scroll / max(1, maxs) * 100)
+            self._sa(top, left + width - 6, f"{pct:3d}%", self._cp("dim"))
+
+    # ── SCENARIO 3: Three snake-flow columns ──────────────────────────────────
+    # Triggered when BOTH nav and rpanel are visible.
+    # Text flows col1 → col2 → col3 (snake-flow across 3 columns).
+
+    def _draw_text_scenario3(self, left: int, width: int, top: int, height: int, W: int):
+        """3-page snake layout: text flows across 3 equal columns."""
+        if width < 24: return
+
+        zm     = ZOOM_LEVELS[self.cfg.get("zoom", ZOOM_DEFAULT)]
+        # 3 columns with 2 dividers
+        # Width budget: width - 2 dividers
+        col_w   = (width - 2) // 3
+        col_pad = max(0, zm // 2)   # gentler zoom for 3-col — less aggressive padding
+        inner_w = max(4, col_w - col_pad * 2 - 1)
+
+        col1_x  = left + col_pad
+        div1_x  = left + col_w
+        col2_x  = div1_x + 1 + col_pad
+        div2_x  = left + col_w * 2 + 1
+        col3_x  = div2_x + 1 + col_pad
+
+        lines = self._get_lines(inner_w)
+        vis_rows = height - 1
+
+        ch_title, _ = self.chapters[self.ch_idx]
+        self._sa(top, left, f" ── {ch_title} "[:width-1], self._cp("accent", bold=True))
+
+        # Dividers
+        for r in range(vis_rows):
+            self._sa(top + 1 + r, div1_x, BOX["v"], self._cp("accent"))
+            self._sa(top + 1 + r, div2_x, BOX["v"], self._cp("accent"))
+
+        # Column markers
+        self._sa(top, col1_x, "① ", self._cp("dim"))
+        self._sa(top, col2_x, "② ", self._cp("dim"))
+        self._sa(top, col3_x, "③ ", self._cp("dim"))
+
+        total_vis  = vis_rows * 3
+        maxs       = max(0, len(lines) - total_vis)
+        self._snake_scroll = min(self._snake_scroll, maxs)
+
+        hl = -1
+        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
+            hl = self._char_to_line(self.player.est_char_pos, lines)
+            if self._autoscroll:
+                mg = 3
+                if hl < self._snake_scroll + mg:
+                    self._snake_scroll = max(0, hl - mg)
+                elif hl >= self._snake_scroll + total_vis - mg:
+                    self._snake_scroll = min(maxs, hl - total_vis + mg + 1)
+
+        self._render_snake_columns(
+            lines, top + 1, vis_rows,
+            [(col1_x, inner_w), (col2_x, inner_w), (col3_x, inner_w)],
+            self._snake_scroll, hl
+        )
+
+        if len(lines) > total_vis:
+            pct = int(self._snake_scroll / max(1, maxs) * 100)
+            self._sa(top, left + width - 6, f"{pct:3d}%", self._cp("dim"))
+
+    # ── Snake column renderer (shared by S2 and S3) ───────────────────────────
+
+    def _render_snake_columns(self, lines: list, top: int, vis_rows: int,
+                              columns: list, scroll: int, hl: int):
+        """
+        Render lines into N columns sequentially (snake-flow).
+        columns: list of (x_pos, inner_width) tuples.
+        scroll:  starting line index in `lines`.
+        hl:      highlighted line index (absolute in `lines`), or -1.
+        """
+        for col_idx, (cx, cw) in enumerate(columns):
+            for row in range(vis_rows):
+                lidx = scroll + col_idx * vis_rows + row
+                y    = top + row
+                if lidx >= len(lines):
+                    break
+                line = lines[lidx]
+                if not line:
+                    continue
+                is_head = (lidx == 0 or (lidx > 0 and not lines[lidx - 1].strip()))
+                if lidx == hl:
+                    self._sa(y, cx, line.ljust(cw)[:cw], self._cp("hl", bold=True))
+                elif is_head:
+                    self._sa(y, cx, line[:cw], self._cp("accent", bold=True))
+                else:
+                    self._sa(y, cx, line[:cw], self._cp("normal"))
 
     # ── Right panel: voices (engine + voice sub-sections) ────────────────────
 
@@ -1676,7 +1894,7 @@ class TUI:
         p      = self.player
         bms    = self.cfg["bookmarks"].get(self._bm_key, [])
         H2, W2 = self.scr.getmaxyx()
-        dh     = 16
+        dh     = 17
         dy     = max(3, H2 - dh - 4)
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
@@ -1699,7 +1917,8 @@ class TUI:
         )
         rows = [
             f"  File       : {self.filename}",
-            f"  Chapter    : {self.ch_idx+1}/{len(self.chapters)}  scroll={self.view_scroll}",
+            f"  Chapter    : {self.ch_idx+1}/{len(self.chapters)}  scroll={self.view_scroll}  snake={self._snake_scroll}",
+            f"  Scenario   : {self._reading_scenario()}  nav={self.nav_visible}  rpanel={self.rpanel}",
             f"  Player     : state={p.state}  chunk={p.chunk_idx}/{p.total_chunks}",
             f"  Playback   : est_pos={p.est_char_pos}  ch_len={p.chapter_len}  cps={p._chars_per_sec:.1f}",
             f"  Paused     : total_paused={p._paused_total:.1f}s",
@@ -1756,6 +1975,8 @@ class TUI:
             return
 
         nav_w, tl, tw, rpl, rpw, hh, fh, ch = self._layout(H, W)
+        scenario = self._reading_scenario()
+
         if plain_up or plain_down:
             delta = -3 if plain_up else 3
             if self.rpanel and mx >= rpl:
@@ -1767,10 +1988,19 @@ class TUI:
                 self.ch_idx = max(0, min(len(self.chapters)-1, self.ch_idx + delta))
                 self._invalidate()
             else:
-                _, _, ew, _, _, _, _, _ = self._layout(H, W)
-                lines = self._get_lines(ew)
-                maxs  = max(0, len(lines)-5)
-                self.view_scroll = max(0, min(maxs, self.view_scroll + delta))
+                # Text area scroll — scenario-aware
+                if scenario == 1:
+                    lines = self._tlines if self._tlines else []
+                    maxs  = max(0, len(lines)-5)
+                    self.view_scroll = max(0, min(maxs, self.view_scroll + delta))
+                else:
+                    lines = self._tlines if self._tlines else []
+                    n_cols = 2 if scenario == 2 else 3
+                    H2, W2 = self.scr.getmaxyx()
+                    vis_rows = ch - 1
+                    total_vis = vis_rows * n_cols
+                    maxs = max(0, len(lines) - total_vis)
+                    self._snake_scroll = max(0, min(maxs, self._snake_scroll + delta))
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
 
@@ -1827,6 +2057,7 @@ class TUI:
                 self._voice_sel  = self.cfg.get("voice_index", 0)
                 self.rp_scroll   = 0
                 self.focus       = "rpanel"
+            self._invalidate()
             return
 
         if key in (ord('B'),):
@@ -1838,12 +2069,14 @@ class TUI:
                 self.rp_sel = 0
                 self.rp_scroll = 0
                 self.focus  = "rpanel"
+            self._invalidate()
             return
 
         if key == 27:
             if self.rpanel:
                 self.rpanel = None
                 self.focus  = "text"
+                self._invalidate()
             return
 
         if key in (ord('n'), ord('N')):
@@ -1895,7 +2128,9 @@ class TUI:
         if key in (ord('g'), ord('G')):
             self._goto_chapter(); return
 
-        # Arrow keys
+        # Arrow keys — scenario-aware scrolling
+        scenario = self._reading_scenario()
+
         if self.focus == "chapters":
             if key == curses.KEY_UP and self.ch_idx > 0:
                 self.ch_idx -= 1; self._invalidate()
@@ -1904,25 +2139,43 @@ class TUI:
         elif self.focus == "rpanel" and self.rpanel:
             self._handle_rp_key(key)
         else:
-            H, W = self.scr.getmaxyx()
-            _, tl, tw, _, _, _, _, _ = self._layout(H, W)
-            zm  = ZOOM_LEVELS[self.cfg.get("zoom", ZOOM_DEFAULT)]
-            ew  = max(8, tw - zm*2)
-            lines = self._get_lines(ew)
-            maxs  = max(0, len(lines)-5)
-            if key == curses.KEY_UP:
-                self.view_scroll = max(0, self.view_scroll-1)
-            elif key == curses.KEY_DOWN:
-                self.view_scroll = min(maxs, self.view_scroll+1)
-            elif key == curses.KEY_PPAGE:
-                self.view_scroll = max(0, self.view_scroll-20)
-            elif key == curses.KEY_NPAGE:
-                self.view_scroll = min(maxs, self.view_scroll+20)
+            if scenario == 1:
+                # Single-column scroll
+                lines = self._tlines if self._tlines else []
+                maxs  = max(0, len(lines)-5)
+                if key == curses.KEY_UP:
+                    self.view_scroll = max(0, self.view_scroll-1)
+                elif key == curses.KEY_DOWN:
+                    self.view_scroll = min(maxs, self.view_scroll+1)
+                elif key == curses.KEY_PPAGE:
+                    self.view_scroll = max(0, self.view_scroll-20)
+                elif key == curses.KEY_NPAGE:
+                    self.view_scroll = min(maxs, self.view_scroll+20)
+            else:
+                # Multi-column snake scroll
+                H, W = self.scr.getmaxyx()
+                _, _, _, _, _, hh, fh, ch_h = self._layout(H, W)
+                vis_rows  = ch_h - 1
+                n_cols    = 2 if scenario == 2 else 3
+                lines     = self._tlines if self._tlines else []
+                total_vis = vis_rows * n_cols
+                maxs      = max(0, len(lines) - total_vis)
+                step      = vis_rows  # one full column page
+                if key == curses.KEY_UP:
+                    self._snake_scroll = max(0, self._snake_scroll - 1)
+                elif key == curses.KEY_DOWN:
+                    self._snake_scroll = min(maxs, self._snake_scroll + 1)
+                elif key == curses.KEY_PPAGE:
+                    self._snake_scroll = max(0, self._snake_scroll - step)
+                elif key == curses.KEY_NPAGE:
+                    self._snake_scroll = min(maxs, self._snake_scroll + step)
 
     def _handle_rp_key(self, key) -> bool:
         """Handle key when right panel is focused. Returns True if consumed."""
         if key == 27:
-            self.rpanel = None; self.focus = "text"; return True
+            self.rpanel = None; self.focus = "text"
+            self._invalidate()
+            return True
 
         if self.rpanel == "voices":
             num_engines = len(ENGINE_ORDER)
