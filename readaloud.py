@@ -7,9 +7,9 @@ Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 
 Reading Scenarios (auto-selected by panel visibility):
-  Scenario 1 — neither panel visible   → 1 bordered reading column
+  Scenario 1 — both panels visible     → 1 bordered reading column (tight space)
   Scenario 2 — exactly one panel       → 2 snake-flow columns
-  Scenario 3 — both panels visible     → 3 snake-flow columns
+  Scenario 3 — neither panel visible   → 3 snake-flow columns (maximum space)
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
@@ -422,7 +422,6 @@ def parse_pdf(path):
         from pdfminer.layout import LTTextContainer
     except ImportError:
         raise ImportError("pdfminer.six not installed — run: pip install pdfminer.six")
-
     pages = []
     for page_layout in extract_pages(path):
         parts = []
@@ -430,8 +429,6 @@ def parse_pdf(path):
             if isinstance(element, LTTextContainer):
                 parts.append(element.get_text())
         pages.append("".join(parts).strip())
-
-    # Group ~10 pages per chapter to keep chunks meaningful
     GROUP = 10
     out, n = [], 1
     for i in range(0, len(pages), GROUP):
@@ -448,10 +445,8 @@ def parse_docx(path):
         import docx
     except ImportError:
         raise ImportError("python-docx not installed — run: pip install python-docx")
-
     doc = docx.Document(path)
     chapters, cur_title, buf = [], "Introduction", []
-
     for para in doc.paragraphs:
         style = para.style.name if para.style else ""
         text  = para.text.strip()
@@ -462,15 +457,11 @@ def parse_docx(path):
             buf = []
         else:
             buf.append(para.text)
-
     if buf and "\n".join(buf).strip():
         chapters.append((cur_title, "\n".join(buf)))
-
-    # Fallback: no headings found — split by paragraph groups
     if not chapters:
         all_text = "\n".join(p.text for p in doc.paragraphs)
         return parse_txt_string(all_text, Path(path).stem)
-
     return [(t, c) for t, c in chapters if len(c.strip()) > 80]
 
 
@@ -1292,11 +1283,19 @@ class TUI:
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _on_chapter_done(self):
-        with self._lock:
-            if self.ch_idx < len(self.chapters) - 1:
-                self.ch_idx += 1
-                self._invalidate()
-                self._play()
+        # Must not call _play()/_stop() directly — this fires from inside
+        # player._thread; calling stop() there causes a self-join deadlock.
+        # Defer to a fresh daemon thread so we're safely outside _thread.
+        def _deferred():
+            with self._lock:
+                if self.ch_idx < len(self.chapters) - 1:
+                    self.ch_idx += 1
+                    self._invalidate()
+                    self._play()
+                else:
+                    # Last chapter finished — settle to idle cleanly
+                    self.player.state = "idle"
+        threading.Thread(target=_deferred, daemon=True).start()
 
     def _play(self):
         engine = self.cfg.get("engine", "edge-tts")
@@ -1316,6 +1315,45 @@ class TUI:
 
         # Prime the next PRELOAD_AHEAD chapters in background
         self._preload.prime(self.chapters, self.ch_idx, engine, voice, speed)
+
+    def _skip_sentences(self, delta: int):
+        """Jump forward (delta>0) or backward (delta<0) by |delta| sentences.
+        Restarts synthesis from the target sentence so audio matches position.
+        Only active while playing or paused; does nothing while loading/generating.
+        """
+        if self.player.state not in ("playing", "paused", "done"):
+            return
+        _, text = self.chapters[self.ch_idx]
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        if not sentences:
+            return
+        # Build cumulative char offsets for each sentence
+        offsets = []
+        pos = 0
+        for s in sentences:
+            offsets.append(pos)
+            pos += len(s) + 1
+        # Find current sentence index from est_char_pos
+        cur_pos = self.player.est_char_pos
+        cur_idx = 0
+        for i, off in enumerate(offsets):
+            if off <= cur_pos:
+                cur_idx = i
+            else:
+                break
+        target_idx = max(0, min(len(sentences) - 1, cur_idx + delta))
+        target_text = " ".join(sentences[target_idx:])
+        target_char = offsets[target_idx]
+        log.info("skip_sentences delta=%d cur=%d target=%d char=%d",
+                 delta, cur_idx, target_idx, target_char)
+        engine = self.cfg.get("engine", "edge-tts")
+        voice  = current_voice_id(self.cfg)
+        speed  = SPEEDS[self.cfg["speed_index"]]
+        self.player.stop()
+        # Seed est_char_pos so highlight lands on correct sentence immediately
+        self.player.chapter_len  = len(text)
+        self.player.est_char_pos = target_char
+        self.player.play(target_text, voice, speed, engine)
 
     # ── Text helpers ──────────────────────────────────────────────────────────
 
@@ -1349,12 +1387,12 @@ class TUI:
 
     def _reading_scenario(self) -> int:
         """
-        1 → neither panel visible  (1 bordered column)
+        1 → both panels visible    (1 bordered column — tight space between panels)
         2 → exactly one panel      (2 snake columns)
-        3 → both panels visible    (3 snake columns)
+        3 → neither panel visible  (3 snake columns — maximum space)
         """
         panels = (1 if self.nav_visible else 0) + (1 if self.rpanel else 0)
-        if panels == 0:
+        if panels == 2:
             return 1
         elif panels == 1:
             return 2
@@ -1553,8 +1591,8 @@ class TUI:
             self._sa(y, 0, line[:width-1], attr)
 
     # ── SCENARIO 1: Single bordered reading column ────────────────────────────
-    # Triggered when NEITHER nav nor rpanel is visible.
-    # Draws a rounded box around the entire text area with symmetric padding.
+    # Triggered when BOTH panels are visible (tight space sandwiched between them).
+    # Draws a rounded box around the text area with symmetric padding.
 
     def _draw_text_scenario1(self, left: int, width: int, top: int, height: int):
         """1-page: bordered reading box, symmetric padding, full content area."""
@@ -1689,7 +1727,7 @@ class TUI:
             self._sa(top, left + width - 6, f"{pct:3d}%", self._cp("dim"))
 
     # ── SCENARIO 3: Three snake-flow columns ──────────────────────────────────
-    # Triggered when BOTH nav and rpanel are visible.
+    # Triggered when NEITHER panel is visible (maximum available width).
     # Text flows col1 → col2 → col3 (snake-flow across 3 columns).
 
     def _draw_text_scenario3(self, left: int, width: int, top: int, height: int, W: int):
@@ -1936,11 +1974,12 @@ class TUI:
         KEYS = [
             ("Spc", "play/pause"),  ("Enter", "play ch"),
             ("n/p",  "next/prev"),  ("\\",     "nav"),
-            ("v",    "voices"),     ("B",      "bookmarks"),
-            ("b",    "+bookmark"),  ("s",      "speed"),
-            ("a",    "align"),      ("t",      "theme"),
-            ("z",    "autoscroll"), ("h",      "highlight"),
-            ("g",    "goto"),       ("C+scroll","zoom"),
+            ("[/]",  "prev/next ❯"),("v",      "voices"),
+            ("B",    "bookmarks"),  ("b",      "+bookmark"),
+            ("s",    "speed"),      ("a",      "align"),
+            ("t",    "theme"),      ("z",      "autoscroll"),
+            ("h",    "highlight"),  ("g",      "goto"),
+            ("C+scroll","zoom"),
         ]
         col_w   = 18
         cols    = 2
@@ -2213,6 +2252,12 @@ class TUI:
                 self.ch_idx -= 1
                 self._invalidate(); self._play()
             return
+
+        if key == ord(']'):
+            self._skip_sentences(+1); return
+
+        if key == ord('['):
+            self._skip_sentences(-1); return
 
         if key in (ord('s'), ord('S')):
             was = self.player.state in ("playing","paused","loading","generating")
