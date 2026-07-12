@@ -7,9 +7,9 @@ Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 
 Reading Scenarios (auto-selected by panel visibility):
-  Scenario 1 — neither panel visible   → 1 bordered reading column
+  Scenario 1 — both panels visible     → 1 bordered reading column (tight space)
   Scenario 2 — exactly one panel       → 2 snake-flow columns
-  Scenario 3 — both panels visible     → 3 snake-flow columns
+  Scenario 3 — neither panel visible   → 3 snake-flow columns (maximum space)
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
@@ -1228,12 +1228,12 @@ class TUI:
 
     def _reading_scenario(self) -> int:
         """
-        1 → neither panel visible  (1 bordered column)
+        1 → both panels visible    (1 bordered column — tight space between panels)
         2 → exactly one panel      (2 snake columns)
-        3 → both panels visible    (3 snake columns)
+        3 → neither panel visible  (3 snake columns — maximum space)
         """
         panels = (1 if self.nav_visible else 0) + (1 if self.rpanel else 0)
-        if panels == 0:
+        if panels == 2:
             return 1
         elif panels == 1:
             return 2
@@ -1432,8 +1432,8 @@ class TUI:
             self._sa(y, 0, line[:width-1], attr)
 
     # ── SCENARIO 1: Single bordered reading column ────────────────────────────
-    # Triggered when NEITHER nav nor rpanel is visible.
-    # Draws a rounded box around the entire text area with symmetric padding.
+    # Triggered when BOTH panels are visible (tight space sandwiched between them).
+    # Draws a rounded box around the text area with symmetric padding.
 
     def _draw_text_scenario1(self, left: int, width: int, top: int, height: int):
         """1-page: bordered reading box, symmetric padding, full content area."""
@@ -1568,7 +1568,7 @@ class TUI:
             self._sa(top, left + width - 6, f"{pct:3d}%", self._cp("dim"))
 
     # ── SCENARIO 3: Three snake-flow columns ──────────────────────────────────
-    # Triggered when BOTH nav and rpanel are visible.
+    # Triggered when NEITHER panel is visible (maximum available width).
     # Text flows col1 → col2 → col3 (snake-flow across 3 columns).
 
     def _draw_text_scenario3(self, left: int, width: int, top: int, height: int, W: int):
