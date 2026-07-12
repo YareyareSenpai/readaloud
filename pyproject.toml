@@ -27,13 +27,11 @@ dependencies = [
 #   pipx install "readaloud[kokoro]"
 #   pipx install "readaloud[piper]"
 #   pipx install "readaloud[f5]"
+#   pipx install "readaloud[formats]"
 #   pipx install "readaloud[all]"
 [project.optional-dependencies]
 kokoro = [
-    # kokoro 0.9.x requires Python <3.13; pykokoro is the ONNX wrapper for 3.13+
-    # pip will pick whichever resolves for the active interpreter
-    "kokoro>=0.9.4; python_version < '3.13'",
-    "pykokoro; python_version >= '3.13'",
+    "kokoro>=0.9.4",
     "onnxruntime>=1.16.0",
 ]
 piper = [
@@ -42,12 +40,21 @@ piper = [
 f5 = [
     "f5-tts>=1.0.0",
 ]
+formats = [
+    "pdfminer.six>=20221105",
+    "python-docx>=1.0.0",
+    "striprtf>=0.0.26",
+    "markdown2>=2.4.0",
+]
 all = [
-    "kokoro>=0.9.4; python_version < '3.13'",
-    "pykokoro; python_version >= '3.13'",
+    "kokoro>=0.9.4",
     "onnxruntime>=1.16.0",
     "piper-tts>=1.2.0",
     "f5-tts>=1.0.0",
+    "pdfminer.six>=20221105",
+    "python-docx>=1.0.0",
+    "striprtf>=0.0.26",
+    "markdown2>=2.4.0",
 ]
 
 [project.scripts]

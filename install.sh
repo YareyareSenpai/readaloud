@@ -80,6 +80,15 @@ step "Installing Core Dependencies"
 "$VENV_DIR/bin/pip" install ebooklib edge-tts soundfile
 info "ebooklib, edge-tts, soundfile installed"
 
+# ── Format parsers (PDF, DOCX, HTML, RTF, Markdown) ──────────────────────────
+step "Installing Format Parsers"
+pip_install pdfminer.six && info "pdfminer.six installed (PDF)"
+pip_install python-docx  && info "python-docx installed (DOCX)"
+pip_install striprtf     && info "striprtf installed (RTF)"
+pip_install markdown2    && info "markdown2 installed (Markdown)"
+# HTML parsing uses the built-in HTMLParser — no extra package needed
+info "HTML parser: built-in (no extra package)"
+
 # ── Kokoro (offline, fast CPU TTS) ───────────────────────────────────────────
 step "Installing Kokoro Offline TTS"
 PY_VER=$("$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")

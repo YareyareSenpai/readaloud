@@ -7,9 +7,9 @@ Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 
 Reading Scenarios (auto-selected by panel visibility):
-  Scenario 1 — both panels visible     → 1 bordered reading column (tight space)
+  Scenario 1 — neither panel visible   → 1 bordered reading column
   Scenario 2 — exactly one panel       → 2 snake-flow columns
-  Scenario 3 — neither panel visible   → 3 snake-flow columns (maximum space)
+  Scenario 3 — both panels visible     → 3 snake-flow columns
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
@@ -413,6 +413,127 @@ def parse_txt(path):
     if buf:
         out.append((f"Part {n}", "\n".join(buf).strip()))
     return [(t, c) for t, c in out if len(c.strip()) > 80]
+
+
+def parse_pdf(path):
+    """Extract text from PDF using pdfminer.six; split into chapters by page groups."""
+    try:
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTTextContainer
+    except ImportError:
+        raise ImportError("pdfminer.six not installed — run: pip install pdfminer.six")
+
+    pages = []
+    for page_layout in extract_pages(path):
+        parts = []
+        for element in page_layout:
+            if isinstance(element, LTTextContainer):
+                parts.append(element.get_text())
+        pages.append("".join(parts).strip())
+
+    # Group ~10 pages per chapter to keep chunks meaningful
+    GROUP = 10
+    out, n = [], 1
+    for i in range(0, len(pages), GROUP):
+        block = "\n\n".join(p for p in pages[i:i+GROUP] if p)
+        if len(block.strip()) > 80:
+            out.append((f"Pages {i+1}–{min(i+GROUP, len(pages))}", block))
+            n += 1
+    return out
+
+
+def parse_docx(path):
+    """Extract text from DOCX via python-docx; split on Heading styles."""
+    try:
+        import docx
+    except ImportError:
+        raise ImportError("python-docx not installed — run: pip install python-docx")
+
+    doc = docx.Document(path)
+    chapters, cur_title, buf = [], "Introduction", []
+
+    for para in doc.paragraphs:
+        style = para.style.name if para.style else ""
+        text  = para.text.strip()
+        if style.startswith("Heading") and text:
+            if buf and "\n".join(buf).strip():
+                chapters.append((cur_title, "\n".join(buf)))
+            cur_title = text
+            buf = []
+        else:
+            buf.append(para.text)
+
+    if buf and "\n".join(buf).strip():
+        chapters.append((cur_title, "\n".join(buf)))
+
+    # Fallback: no headings found — split by paragraph groups
+    if not chapters:
+        all_text = "\n".join(p.text for p in doc.paragraphs)
+        return parse_txt_string(all_text, Path(path).stem)
+
+    return [(t, c) for t, c in chapters if len(c.strip()) > 80]
+
+
+def parse_html(path):
+    """Parse standalone HTML file using the existing HTML stripper."""
+    raw = Path(path).read_bytes()
+    text = _html_to_text(raw)
+    return parse_txt_string(text, Path(path).stem)
+
+
+def parse_rtf(path):
+    """Strip RTF markup and treat as plain text."""
+    try:
+        from striprtf.striprtf import rtf_to_text
+    except ImportError:
+        raise ImportError("striprtf not installed — run: pip install striprtf")
+    raw  = Path(path).read_text(errors="replace")
+    text = rtf_to_text(raw)
+    return parse_txt_string(text, Path(path).stem)
+
+
+def parse_md(path):
+    """Convert Markdown → HTML → plain text."""
+    try:
+        import markdown2
+    except ImportError:
+        raise ImportError("markdown2 not installed — run: pip install markdown2")
+    raw  = Path(path).read_text(errors="replace")
+    html = markdown2.markdown(raw, extras=["fenced-code-blocks", "tables"])
+    text = _html_to_text(html.encode("utf-8"))
+    return parse_txt_string(text, Path(path).stem)
+
+
+def parse_txt_string(text: str, stem: str) -> list:
+    """Split a plain-text string into chapter tuples (shared helper)."""
+    chunks = re.split(r'\n{3,}|(?m)^(Chapter\s+\w+.*)', text)
+    out, buf, n = [], [], 1
+    for chunk in chunks:
+        if chunk is None:
+            continue
+        buf.append(chunk)
+        if len("\n".join(buf)) > 8000:
+            out.append((f"{stem} — Part {n}", "\n".join(buf).strip()))
+            buf, n = [], n + 1
+    if buf:
+        out.append((f"{stem} — Part {n}", "\n".join(buf).strip()))
+    return [(t, c) for t, c in out if len(c.strip()) > 80]
+
+
+# Dispatch table: extension → parser function
+_EXT_PARSER = {
+    ".epub": parse_epub,
+    ".txt":  parse_txt,
+    ".pdf":  parse_pdf,
+    ".docx": parse_docx,
+    ".html": parse_html,
+    ".htm":  parse_html,
+    ".rtf":  parse_rtf,
+    ".md":   parse_md,
+    ".markdown": parse_md,
+}
+
+SUPPORTED_EXTS = frozenset(_EXT_PARSER.keys())
 
 
 # ─── Constants & config ───────────────────────────────────────────────────────
@@ -1228,12 +1349,12 @@ class TUI:
 
     def _reading_scenario(self) -> int:
         """
-        1 → both panels visible    (1 bordered column — tight space between panels)
+        1 → neither panel visible  (1 bordered column)
         2 → exactly one panel      (2 snake columns)
-        3 → neither panel visible  (3 snake columns — maximum space)
+        3 → both panels visible    (3 snake columns)
         """
         panels = (1 if self.nav_visible else 0) + (1 if self.rpanel else 0)
-        if panels == 2:
+        if panels == 0:
             return 1
         elif panels == 1:
             return 2
@@ -1432,8 +1553,8 @@ class TUI:
             self._sa(y, 0, line[:width-1], attr)
 
     # ── SCENARIO 1: Single bordered reading column ────────────────────────────
-    # Triggered when BOTH panels are visible (tight space sandwiched between them).
-    # Draws a rounded box around the text area with symmetric padding.
+    # Triggered when NEITHER nav nor rpanel is visible.
+    # Draws a rounded box around the entire text area with symmetric padding.
 
     def _draw_text_scenario1(self, left: int, width: int, top: int, height: int):
         """1-page: bordered reading box, symmetric padding, full content area."""
@@ -1568,7 +1689,7 @@ class TUI:
             self._sa(top, left + width - 6, f"{pct:3d}%", self._cp("dim"))
 
     # ── SCENARIO 3: Three snake-flow columns ──────────────────────────────────
-    # Triggered when NEITHER panel is visible (maximum available width).
+    # Triggered when BOTH nav and rpanel are visible.
     # Text flows col1 → col2 → col3 (snake-flow across 3 columns).
 
     def _draw_text_scenario3(self, left: int, width: int, top: int, height: int, W: int):
@@ -2299,7 +2420,7 @@ def pick_file(stdscr):
         try:
             if d != d.parent: out.append(("..", True, d.parent))
             for p in sorted(d.iterdir(), key=lambda p:(not p.is_dir(), p.name.lower())):
-                if not p.name.startswith(".") and (p.is_dir() or p.suffix.lower() in (".epub",".txt")):
+                if not p.name.startswith(".") and (p.is_dir() or p.suffix.lower() in SUPPORTED_EXTS):
                     out.append((p.name, p.is_dir(), p))
         except PermissionError: pass
         return out
@@ -2374,10 +2495,17 @@ def main():
 
     ext = Path(filepath).suffix.lower()
     print(f"Parsing {Path(filepath).name}…", end="", flush=True)
+    parser = _EXT_PARSER.get(ext)
+    if parser is None:
+        supported = "  ".join(sorted(SUPPORTED_EXTS))
+        print(f"\nUnsupported format: {ext}\nSupported: {supported}")
+        sys.exit(1)
     try:
-        if ext == ".epub":   chapters = parse_epub(filepath)
-        elif ext == ".txt":  chapters = parse_txt(filepath)
-        else: print(f"\nUnsupported: {ext}"); sys.exit(1)
+        chapters = parser(filepath)
+    except ImportError as e:
+        print(f"\nMissing dependency: {e}")
+        log.exception("parse error")
+        sys.exit(1)
     except Exception as e:
         print(f"\nParse error: {e}")
         log.exception("parse error")

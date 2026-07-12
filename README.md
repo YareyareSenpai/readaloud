@@ -26,7 +26,7 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 
 - **Multi-backend TTS** — online (Edge TTS) and offline (Kokoro, Piper, F5-TTS) engines; auto-detected at startup
 - **12 Edge TTS voices** — US/GB/AU/CA English via Microsoft's neural API; 7 Kokoro voices included; Piper uses your own ONNX models; F5-TTS clones any voice from a reference WAV
-- **EPUB & TXT support** — chapters parsed from spine order; TXT split by headings or blank lines
+- **Wide format support** — EPUB, TXT, PDF, DOCX, HTML, RTF, and Markdown; chapters parsed from structure (headings, spine, page groups) or split by content length
 - **Adaptive reading layout** — 3 scenarios auto-selected by panel visibility: single focused column (both panels open), two-column snake (one panel), three-column snake (both panels hidden)
 - **Rice-friendly** — `Terminal` theme uses your kitty/terminal colours as-is; 4 additional themes (Dark Navy, Gruvbox, Nord, Solarized Dark) for 256-colour terminals
 - **Tiling-friendly** — layout reflows on any resize; works in any window size ≥50×14
@@ -74,6 +74,16 @@ Everything else (Python packages, engine binaries) is handled automatically by `
 | **Kokoro** | `pykokoro` + `onnxruntime` + spaCy `en_core_web_sm` in venv (falls back to native `kokoro` on Python <3.13); ONNX model weights (~800 MB) downloaded from HuggingFace on first use |
 | **Piper** | `piper-tts` in venv; binary symlinked to `~/.local/bin/piper` |
 | **F5-TTS** | `f5-tts` in venv (skipped gracefully if torch/CUDA missing); binary symlinked to `~/.local/bin/f5-tts_infer-cli` |
+
+| Format | Parser | What gets installed |
+|--------|--------|---------------------|
+| EPUB | `ebooklib` | installed as core dependency |
+| TXT | built-in | no extra package |
+| PDF | `pdfminer.six` | installed by `install.sh` |
+| DOCX | `python-docx` | installed by `install.sh` |
+| HTML / HTM | built-in `HTMLParser` | no extra package |
+| RTF | `striprtf` | installed by `install.sh` |
+| MD / Markdown | `markdown2` | installed by `install.sh` |
 
 ### What you must provide manually (post-install)
 
@@ -129,12 +139,13 @@ Installs `readaloud` as a fully isolated pipx app with Edge TTS + Kokoro as the 
 pipx install .
 ```
 
-Install with specific offline engines:
+Install with specific offline engines or format parsers:
 
 ```bash
 pipx install ".[kokoro]"     # + Kokoro
 pipx install ".[piper]"      # + Piper
 pipx install ".[f5]"         # + F5-TTS (needs torch)
+pipx install ".[formats]"    # + PDF, DOCX, RTF, Markdown parsers
 pipx install ".[all]"        # everything
 ```
 
@@ -190,8 +201,13 @@ rm -f ~/.local/bin/readaloud ~/.local/bin/piper ~/.local/bin/f5-tts_infer-cli
 
 ```bash
 readaloud                   # open file browser
-readaloud book.epub         # open directly
-readaloud chapter.txt       # plain text supported
+readaloud book.epub         # EPUB
+readaloud chapter.txt       # plain text
+readaloud paper.pdf         # PDF
+readaloud report.docx       # Word document
+readaloud article.html      # HTML
+readaloud notes.rtf         # RTF
+readaloud README.md         # Markdown
 readaloud book.epub --debug # start with debug overlay
 ```
 
@@ -381,7 +397,7 @@ Debug logs: `~/.config/readaloud/debug.log`
 
 ## How It Works
 
-1. **Parsing** — `ebooklib` reads the EPUB spine and extracts plain text per chapter via a custom HTML stripper. TXT files split by heading patterns or blank lines.
+1. **Parsing** — Format is detected by file extension and routed through `_EXT_PARSER`: `ebooklib` for EPUB (spine order, HTML-stripped); `pdfminer.six` for PDF (grouped by ~10 pages); `python-docx` for DOCX (split on Heading styles); built-in `HTMLParser` for HTML/HTM; `striprtf` for RTF; `markdown2` + HTML stripper for Markdown; plain text split by heading patterns or blank lines for TXT.
 2. **Engine scan** — at startup, `SystemScanner` checks for binary commands (`piper`, `f5-tts_infer-cli`, `ffplay`) and Python imports (`kokoro`, `piper`, `f5_tts`, `edge_tts`) to build an availability map. Unavailable engines are shown greyed out in the voices panel.
 3. **TTS** — chapter text is split into ≤4500-char chunks at sentence boundaries, each synthesised by the active backend: Edge TTS writes MP3 via `pipx run edge-tts`; Kokoro uses `pykokoro` (Python 3.13+) or native `kokoro` (<3.13) with a cached ONNX session — the pipeline is built once per voice/speed pair and reused across chunks; Piper pipes stdin to its binary with an ONNX model; F5-TTS calls `f5-tts_infer-cli` with `ref.wav`.
 4. **Playback** — `ffplay` plays all chunks as a concat playlist with an `atempo` filter for speed control. Pause/resume via `SIGSTOP`/`SIGCONT` on the ffplay process. WAV and MP3 chunks are handled identically by the concat pipeline.
