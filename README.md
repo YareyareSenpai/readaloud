@@ -1,6 +1,6 @@
 # readaloud
 
-A terminal EPUB/TXT reader with multi-backend neural TTS, built for Linux. No Electron, no browser, no SpeakUB — just a fast curses TUI, natural-sounding voices via online or offline TTS engines, and playback through `ffplay`.
+A terminal EPUB/TXT reader with multi-backend neural TTS, built for Linux. A fast curses TUI, natural-sounding voices via online or offline TTS engines, and playback through `ffplay`.
 
 Follows your terminal colour scheme out of the box. Tiling-friendly — resize the window and the layout reflows.
 
@@ -8,17 +8,17 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 
 ## Showcase
 
-**Default layout — chapter nav, reading area, bordered key reference**
+**Reading scenario 1 — both panels visible, single focused reading column**
 
-![Default layout with chapter navigation and key reference](screenshot-default.png)
+![Both panels open, single reading column](260712_08h57m51s_screenshot.png)
 
-**Voices panel open — engine selector and voice list, slides in from the right**
+**Reading scenario 2 — one panel visible, two-column snake layout**
 
-![Voices panel open on the right](screenshot-voices.png)
+![One panel open, two-column snake flow](260712_08h57m09s_screenshot.png)
 
-**Tiling with a live wallpaper — transparent terminal, full reflow**
+**Reading scenario 3 — both panels hidden, three-column snake layout**
 
-![Tiling window manager with wallpaper bleed-through](screenshot-tiling.png)
+![Both panels hidden, three-column snake flow](260712_08h56m06s_screenshot.png)
 
 ---
 
@@ -27,7 +27,7 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 - **Multi-backend TTS** — online (Edge TTS) and offline (Kokoro, Piper, F5-TTS) engines; auto-detected at startup
 - **12 Edge TTS voices** — US/GB/AU/CA English via Microsoft's neural API; 7 Kokoro voices included; Piper uses your own ONNX models; F5-TTS clones any voice from a reference WAV
 - **EPUB & TXT support** — chapters parsed from spine order; TXT split by headings or blank lines
-- **Three-column layout** — chapters left, reading area centre, voices/bookmarks panel right
+- **Adaptive reading layout** — 3 scenarios auto-selected by panel visibility: single focused column (both panels open), two-column snake (one panel), three-column snake (both panels hidden)
 - **Rice-friendly** — `Terminal` theme uses your kitty/terminal colours as-is; 4 additional themes (Dark Navy, Gruvbox, Nord, Solarized Dark) for 256-colour terminals
 - **Tiling-friendly** — layout reflows on any resize; works in any window size ≥50×14
 - **Text highlight** — current sentence tracked in sync with playback; toggle on/off with `h`
@@ -445,12 +445,6 @@ Some EPUBs have non-standard spine structures. Check `~/.config/readaloud/debug.
 ```bash
 ebook-convert book.epub book.txt
 ```
-
----
-
-## Why Not SpeakUB?
-
-SpeakUB's Edge-TTS integration hardcodes `pygame.mixer` for audio output, which fails on Arch Linux with PipeWire. The `tts_backend: mpv` config override isn't actually wired up. `readaloud` owns the full pipeline — TTS generation straight to `ffplay`, no intermediate audio framework — and adds offline engine support on top.
 
 ---
 
