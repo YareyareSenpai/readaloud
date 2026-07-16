@@ -819,39 +819,69 @@ def wrap_text(text, width, align):
 
 
 def _audio_duration(path: str) -> float:
-    """Return duration in seconds of an audio file using ffprobe.
-    Returns 0.0 on any error (graceful degradation to WPM estimate).
+    """Return duration in seconds of an audio file.
+    Tries soundfile first (core dep, handles WAV perfectly), then ffprobe for MP3.
+    Returns 0.0 on any error — caller falls back to WPM estimate.
     """
+    # soundfile handles WAV natively and is a guaranteed core dependency
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        return info.duration
+    except Exception:
+        pass
+    # ffprobe fallback for MP3 (ships with ffmpeg, same package as ffplay)
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=5)
-        return float(result.stdout.strip())
+        val = result.stdout.strip()
+        if val:
+            return float(val)
     except Exception:
-        return 0.0
+        pass
+    return 0.0
 
 
 def _build_timing_map(chunks: List[str], audio_files: List[str],
                       speed: float) -> List[tuple]:
-    """Build a cumulative (playback_time_secs, char_offset) timeline from
-    per-chunk audio durations.  The atempo filter compresses duration by 1/speed,
-    so we divide ffprobe duration by speed.
-    Returns list sorted by time; guaranteed to start with (0.0, 0).
+    """Build a fine-grained (playback_time_secs, char_offset) timeline.
+
+    For each chunk we measure the actual audio duration (soundfile → ffprobe →
+    WPM fallback), then distribute that duration across the sentences inside the
+    chunk proportionally by word count.  This gives sentence-level granularity
+    even when no word-boundary events are available (offline engines / CLI path).
+
+    atempo compresses playback by 1/speed, so raw_dur is divided by speed.
+    Returns list sorted by time, guaranteed to start with (0.0, 0).
     """
-    timeline = [(0.0, 0)]
+    timeline: List[tuple] = [(0.0, 0)]
     cumulative_time  = 0.0
     cumulative_chars = 0
+
     for chunk, afile in zip(chunks, audio_files):
         raw_dur = _audio_duration(afile)
         if raw_dur <= 0:
-            # Fallback: estimate from WPM
             words   = len(chunk.split())
             raw_dur = (words / 140.0) * 60.0
-        playback_dur     = raw_dur / speed
-        cumulative_time += playback_dur
-        cumulative_chars += len(chunk) + 1   # +1 for the space join
-        timeline.append((cumulative_time, cumulative_chars))
+        playback_dur = raw_dur / speed
+
+        # Split chunk into sentences and distribute duration by word-count weight
+        sentences = re.split(r'(?<=[.!?])\s+', chunk)
+        total_words = max(1, sum(len(s.split()) for s in sentences))
+        pos = cumulative_chars
+        t   = cumulative_time
+        for sent in sentences:
+            w      = len(sent.split())
+            frac   = w / total_words
+            t     += playback_dur * frac
+            pos   += len(sent) + 1
+            timeline.append((t, pos))
+
+        cumulative_time  += playback_dur
+        cumulative_chars += len(chunk) + 1
+
     return timeline
 
 
@@ -1833,7 +1863,7 @@ class TUI:
         self.view_scroll = min(self.view_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
+        if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
             if self._autoscroll:
                 mg = 3
@@ -1899,7 +1929,7 @@ class TUI:
         self._snake_scroll = min(self._snake_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
+        if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
             # Autoscroll: keep hl visible across the combined 2-column view
             if self._autoscroll:
@@ -1963,7 +1993,7 @@ class TUI:
         self._snake_scroll = min(self._snake_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
+        if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
             if self._autoscroll:
                 mg = 3
