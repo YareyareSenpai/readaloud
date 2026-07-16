@@ -49,17 +49,63 @@ class BaseTTSBackend:
 
 
 class EdgeTTSBackend(BaseTTSBackend):
-    """Microsoft Edge neural TTS via pipx run edge-tts (online)."""
+    """Microsoft Edge neural TTS — uses edge_tts Python API for WordBoundary timing.
+    Falls back to CLI subprocess if the import is unavailable.
+    generate_chunk_with_timing() returns (success, [(audio_secs, char_offset), ...]).
+    """
+
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        ok, _ = self.generate_chunk_with_timing(text, voice, speed, output_path)
+        return ok
+
+    def generate_chunk_with_timing(self, text: str, voice: str, speed: float,
+                                    output_path: str) -> tuple:
+        """Returns (success, timing_map).
+        timing_map is a list of (audio_time_seconds, char_offset_in_text) sorted by time.
+        Uses edge_tts.Communicate.stream() for word-boundary events when available.
+        Falls back to CLI (no timing data) if the library is absent.
+        """
+        # ── Try library path (word-level timing) ─────────────────────────────
+        try:
+            import edge_tts
+            import asyncio
+
+            timing_map: List[tuple] = []
+
+            async def _stream():
+                communicate = edge_tts.Communicate(text, voice)
+                audio_bytes = bytearray()
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_bytes.extend(chunk["data"])
+                    elif chunk["type"] == "WordBoundary":
+                        # offset is in 100-nanosecond ticks; char offset in text
+                        audio_secs  = chunk["offset"] / 10_000_000.0
+                        char_offset = chunk.get("text_offset", 0)
+                        timing_map.append((audio_secs, char_offset))
+                with open(output_path, "wb") as f:
+                    f.write(audio_bytes)
+
+            asyncio.run(_stream())
+            log.debug("EdgeTTS stream: %d word events for %d chars", len(timing_map), len(text))
+            return True, timing_map
+
+        except ImportError:
+            log.debug("edge_tts library not available, falling back to CLI")
+        except Exception as e:
+            log.error("EdgeTTS stream error: %s", e)
+            return False, []
+
+        # ── CLI fallback (no timing data) ─────────────────────────────────────
         try:
             subprocess.run(
                 ["pipx", "run", "edge-tts",
                  "--voice", voice, "--text", text, "--write-media", output_path],
                 check=True, capture_output=True, timeout=60)
-            return True
+            return True, []
         except Exception as e:
-            log.error("EdgeTTS error: %s", e)
-            return False
+            log.error("EdgeTTS CLI error: %s", e)
+            return False, []
 
 
 class KokoroBackend(BaseTTSBackend):
@@ -772,6 +818,59 @@ def wrap_text(text, width, align):
     return lines
 
 
+def _audio_duration(path: str) -> float:
+    """Return duration in seconds of an audio file using ffprobe.
+    Returns 0.0 on any error (graceful degradation to WPM estimate).
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=5)
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _build_timing_map(chunks: List[str], audio_files: List[str],
+                      speed: float) -> List[tuple]:
+    """Build a cumulative (playback_time_secs, char_offset) timeline from
+    per-chunk audio durations.  The atempo filter compresses duration by 1/speed,
+    so we divide ffprobe duration by speed.
+    Returns list sorted by time; guaranteed to start with (0.0, 0).
+    """
+    timeline = [(0.0, 0)]
+    cumulative_time  = 0.0
+    cumulative_chars = 0
+    for chunk, afile in zip(chunks, audio_files):
+        raw_dur = _audio_duration(afile)
+        if raw_dur <= 0:
+            # Fallback: estimate from WPM
+            words   = len(chunk.split())
+            raw_dur = (words / 140.0) * 60.0
+        playback_dur     = raw_dur / speed
+        cumulative_time += playback_dur
+        cumulative_chars += len(chunk) + 1   # +1 for the space join
+        timeline.append((cumulative_time, cumulative_chars))
+    return timeline
+
+
+def _lookup_timing(timing_map: List[tuple], elapsed: float) -> int:
+    """Binary-search timing_map for the char offset at `elapsed` seconds.
+    timing_map must be sorted by time (first element of each tuple).
+    """
+    if not timing_map:
+        return 0
+    lo, hi = 0, len(timing_map) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if timing_map[mid][0] <= elapsed:
+            lo = mid
+        else:
+            hi = mid - 1
+    return timing_map[lo][1]
+
+
 # ─── Player ───────────────────────────────────────────────────────────────────
 
 class Player:
@@ -783,7 +882,8 @@ class Player:
         self.est_char_pos  = 0
         self.play_start_ts = 0.0
         self.chapter_len   = 0
-        self._chars_per_sec = 11.67
+        self._chars_per_sec = 11.67   # fallback only; superseded by timing_map
+        self._timing_map: List[tuple] = []   # [(playback_secs, char_offset), ...]
         self._proc         = None
         self._thread       = None
         self._stop_evt     = threading.Event()
@@ -818,7 +918,8 @@ class Player:
 
     def _run(self, text: str, voice: str, speed: float, engine: str):
         mgr = get_manager()
-        is_f5 = (engine == "f5-tts")
+        is_f5    = (engine == "f5-tts")
+        is_edge  = (engine == "edge-tts")
         self.state = "generating" if is_f5 else "loading"
         self.error_msg = ""
         tmpdir = tempfile.mkdtemp(prefix="readaloud_")
@@ -826,8 +927,17 @@ class Player:
 
         chunks = split_text(text)
         self.total_chunks = len(chunks)
-        audio_files = []
-        ext = mgr.output_ext(engine)
+        audio_files  = []
+        ext          = mgr.output_ext(engine)
+        # Accumulated WordBoundary events from Edge TTS (absolute char offsets)
+        edge_wb_map: List[tuple] = []   # [(audio_secs, char_offset_in_full_text)]
+        chunk_char_offsets: List[int] = []  # where each chunk starts in full text
+
+        # Build chunk start offsets (mirrors split_text logic)
+        pos = 0
+        for chunk in chunks:
+            chunk_char_offsets.append(pos)
+            pos += len(chunk) + 1
 
         for i, chunk in enumerate(chunks):
             if self._stop_evt.is_set():
@@ -836,7 +946,25 @@ class Player:
             if is_f5:
                 self._tick_anim()
             outfile = os.path.join(tmpdir, f"chunk_{i:04d}{ext}")
-            ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
+
+            if is_edge:
+                backend = mgr._backends["edge-tts"]
+                ok, wb_events = backend.generate_chunk_with_timing(chunk, voice, speed, outfile)
+                if ok and wb_events:
+                    # Translate chunk-relative char offsets to full-text offsets
+                    # and accumulate chunk audio time offset
+                    chunk_audio_start = sum(
+                        _audio_duration(audio_files[j]) / speed
+                        for j in range(len(audio_files))
+                    ) if audio_files else 0.0
+                    for (t, c) in wb_events:
+                        edge_wb_map.append((
+                            chunk_audio_start + t,
+                            chunk_char_offsets[i] + c
+                        ))
+            else:
+                ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
+
             if not ok:
                 self.state = "error"
                 backend = mgr._backends.get(engine)
@@ -856,12 +984,20 @@ class Player:
             self._cleanup(tmpdir)
             self.state = "idle"; return
 
+        # Build timing map
+        if is_edge and edge_wb_map:
+            self._timing_map = [(0.0, 0)] + edge_wb_map
+            log.debug("EdgeTTS timing map: %d events", len(self._timing_map))
+        else:
+            self._timing_map = _build_timing_map(chunks, audio_files, speed)
+            log.debug("Duration timing map: %d events", len(self._timing_map))
+
         playlist = os.path.join(tmpdir, "playlist.txt")
         with open(playlist, "w") as f:
             for af in audio_files:
                 f.write(f"file '{af}'\n")
 
-        # Speed filter: edge-tts uses atempo; wav backends rely on atempo too
+        # Speed filter via atempo
         tempo = speed
         chain = []
         while tempo > 2.0:
@@ -870,8 +1006,7 @@ class Player:
 
         self.state = "playing"
         self.play_start_ts = time.time()
-        self._chars_per_sec = 140 / 60 * 5 * speed
-        log.debug("playback start chars_per_sec=%.1f", self._chars_per_sec)
+        log.debug("playback start, timing_map entries=%d", len(self._timing_map))
 
         try:
             self._proc = subprocess.Popen(
@@ -895,9 +1030,10 @@ class Player:
                         self.state = "playing"
                 else:
                     elapsed = time.time() - self.play_start_ts - self._paused_total
-                    self.est_char_pos = min(int(elapsed * self._chars_per_sec),
-                                           self.chapter_len)
-                time.sleep(0.2)
+                    self.est_char_pos = min(
+                        _lookup_timing(self._timing_map, elapsed),
+                        self.chapter_len)
+                time.sleep(0.1)
         except Exception as e:
             self.state = "error"; self.error_msg = str(e)
             log.exception("ffplay error")
@@ -929,20 +1065,24 @@ class Player:
         log.debug("player stopped")
 
     def play_cached(self, playlist: str, audio_dir: str,
-                    chapter_len: int, speed: float):
-        """Start playback from a pre-synthesized playlist (cache hit)."""
+                    chapter_len: int, speed: float,
+                    timing_map: Optional[List[tuple]] = None):
+        """Start playback from a pre-synthesized playlist (cache hit).
+        timing_map, if provided, is used for accurate position tracking.
+        """
         self.stop()
         self._stop_evt.clear()
         self._pause_evt.clear()
         self._paused_total = 0.0
         self.chapter_len   = chapter_len
         self.est_char_pos  = 0
+        self._timing_map   = timing_map or []
         self._thread = threading.Thread(
-            target=self._run_cached, args=(playlist, audio_dir, speed), daemon=True)
+            target=self._run_cached, args=(playlist, speed), daemon=True)
         self._thread.start()
 
-    def _run_cached(self, playlist: str, audio_dir: str, speed: float):
-        """ffplay loop for a pre-built playlist; mirrors end of _run()."""
+    def _run_cached(self, playlist: str, speed: float):
+        """ffplay loop for a pre-built playlist; uses timing_map for position."""
         tempo = speed
         chain = []
         while tempo > 2.0:
@@ -951,9 +1091,8 @@ class Player:
 
         self.state = "playing"
         self.play_start_ts = time.time()
-        self._chars_per_sec = 140 / 60 * 5 * speed
         self.error_msg = ""
-        log.debug("play_cached: %s", playlist)
+        log.debug("play_cached: %s, timing_map entries=%d", playlist, len(self._timing_map))
 
         try:
             self._proc = subprocess.Popen(
@@ -977,9 +1116,15 @@ class Player:
                         self.state = "playing"
                 else:
                     elapsed = time.time() - self.play_start_ts - self._paused_total
-                    self.est_char_pos = min(int(elapsed * self._chars_per_sec),
-                                           self.chapter_len)
-                time.sleep(0.2)
+                    if self._timing_map:
+                        self.est_char_pos = min(
+                            _lookup_timing(self._timing_map, elapsed),
+                            self.chapter_len)
+                    else:
+                        # Fallback WPM estimate if no timing map saved
+                        cps = 140 / 60 * 5 * speed
+                        self.est_char_pos = min(int(elapsed * cps), self.chapter_len)
+                time.sleep(0.1)
         except Exception as e:
             self.state = "error"; self.error_msg = str(e)
             log.exception("ffplay cached error")
@@ -1034,13 +1179,24 @@ class PreloadCache:
         entry = CACHE_DIR / self.key(ch_idx, engine, voice, speed)
         return (entry / ".done").exists()
 
-    def get_playlist(self, ch_idx: int, engine: str, voice: str, speed: float) -> Optional[str]:
-        """Return path to playlist.txt if cache is warm, else None."""
+    def get_playlist(self, ch_idx: int, engine: str, voice: str,
+                     speed: float) -> Optional[tuple]:
+        """Return (playlist_path, timing_map) if cache is warm, else None.
+        timing_map may be [] if not saved (old cache entry).
+        """
         entry = CACHE_DIR / self.key(ch_idx, engine, voice, speed)
         pl    = entry / "playlist.txt"
-        if (entry / ".done").exists() and pl.exists():
-            return str(pl)
-        return None
+        if not ((entry / ".done").exists() and pl.exists()):
+            return None
+        timing_map: List[tuple] = []
+        timing_file = entry / "timing.json"
+        if timing_file.exists():
+            try:
+                raw = json.loads(timing_file.read_text())
+                timing_map = [tuple(x) for x in raw]
+            except Exception as e:
+                log.warning("preload: failed to read timing.json ch=%d: %s", ch_idx, e)
+        return str(pl), timing_map
 
     def prime(self, chapters: list, from_idx: int,
               engine: str, voice: str, speed: float):
@@ -1126,10 +1282,11 @@ class PreloadCache:
 
     def _synthesize(self, ch_idx: int, text: str, engine: str,
                     voice: str, speed: float, cancel: threading.Event):
-        mgr   = get_manager()
-        k     = self.key(ch_idx, engine, voice, speed)
-        entry = CACHE_DIR / k
-        done  = entry / ".done"
+        mgr      = get_manager()
+        is_edge  = (engine == "edge-tts")
+        k        = self.key(ch_idx, engine, voice, speed)
+        entry    = CACHE_DIR / k
+        done     = entry / ".done"
 
         # Another process may have already written this entry
         if done.exists():
@@ -1147,7 +1304,15 @@ class PreloadCache:
 
         chunks = split_text(text)
         ext    = mgr.output_ext(engine)
-        audio_files = []
+        audio_files   = []
+        edge_wb_map: List[tuple] = []
+
+        # Build chunk start offsets
+        chunk_char_offsets: List[int] = []
+        pos = 0
+        for chunk in chunks:
+            chunk_char_offsets.append(pos)
+            pos += len(chunk) + 1
 
         for i, chunk in enumerate(chunks):
             if cancel.is_set():
@@ -1155,7 +1320,23 @@ class PreloadCache:
                 log.debug("preload: ch=%d cancelled at chunk %d", ch_idx, i)
                 return
             outfile = str(tmp_entry / f"chunk_{i:04d}{ext}")
-            ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
+
+            if is_edge:
+                backend = mgr._backends["edge-tts"]
+                ok, wb_events = backend.generate_chunk_with_timing(chunk, voice, speed, outfile)
+                if ok and wb_events:
+                    chunk_audio_start = sum(
+                        _audio_duration(audio_files[j]) / speed
+                        for j in range(len(audio_files))
+                    ) if audio_files else 0.0
+                    for (t, c) in wb_events:
+                        edge_wb_map.append((
+                            chunk_audio_start + t,
+                            chunk_char_offsets[i] + c
+                        ))
+            else:
+                ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
+
             if not ok or not os.path.exists(outfile):
                 shutil.rmtree(str(tmp_entry), ignore_errors=True)
                 log.warning("preload: ch=%d synthesis failed chunk %d", ch_idx, i)
@@ -1167,6 +1348,12 @@ class PreloadCache:
             shutil.rmtree(str(tmp_entry), ignore_errors=True)
             return
 
+        # Build and save timing map
+        if is_edge and edge_wb_map:
+            timing_map = [(0.0, 0)] + edge_wb_map
+        else:
+            timing_map = _build_timing_map(chunks, audio_files, speed)
+
         # Write playlist using final paths (after rename)
         final_audio = [str(entry / Path(af).name) for af in audio_files]
         pl_path = tmp_entry / "playlist.txt"
@@ -1174,13 +1361,20 @@ class PreloadCache:
             for af in final_audio:
                 f.write(f"file '{af}'\n")
 
+        timing_path = tmp_entry / "timing.json"
+        try:
+            timing_path.write_text(json.dumps(timing_map))
+        except Exception as e:
+            log.warning("preload: failed to write timing.json ch=%d: %s", ch_idx, e)
+
         # Atomic rename tmp → final
         try:
             if entry.exists():
                 shutil.rmtree(str(entry), ignore_errors=True)
             tmp_entry.rename(entry)
             (entry / ".done").touch()
-            log.info("preload: ch=%d warm (%d chunks, engine=%s)", ch_idx, len(chunks), engine)
+            log.info("preload: ch=%d warm (%d chunks, %d timing events, engine=%s)",
+                     ch_idx, len(chunks), len(timing_map), engine)
         except Exception as e:
             log.warning("preload: rename failed ch=%d: %s", ch_idx, e)
             shutil.rmtree(str(tmp_entry), ignore_errors=True)
@@ -1304,11 +1498,12 @@ class TUI:
         _, text = self.chapters[self.ch_idx]
         log.info("play ch=%d engine=%s voice=%s speed=%s", self.ch_idx, engine, voice, speed)
 
-        pl = self._preload.get_playlist(self.ch_idx, engine, voice, speed)
-        if pl:
-            log.info("preload: cache HIT ch=%d", self.ch_idx)
+        cached = self._preload.get_playlist(self.ch_idx, engine, voice, speed)
+        if cached:
+            pl, timing_map = cached
+            log.info("preload: cache HIT ch=%d timing_events=%d", self.ch_idx, len(timing_map))
             self.player.play_cached(pl, str(CACHE_DIR / self._preload.key(
-                self.ch_idx, engine, voice, speed)), len(text), speed)
+                self.ch_idx, engine, voice, speed)), len(text), speed, timing_map)
         else:
             log.info("preload: cache MISS ch=%d — synthesizing live", self.ch_idx)
             self.player.play(text, voice, speed, engine)
