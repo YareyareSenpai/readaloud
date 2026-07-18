@@ -1625,56 +1625,6 @@ class TUI:
                 return i
         return len(lines) - 1
 
-    def _char_to_col(self, pos, lines, line_idx: int) -> int:
-        """Return the column offset within lines[line_idx] for char pos."""
-        # Cumulative chars before line_idx
-        before = sum(len(l.strip()) + 1 for l in lines[:line_idx])
-        return max(0, pos - before)
-
-    def _render_hl_line(self, y: int, x: int, line: str, width: int,
-                        word_col: int, engine: str):
-        """Render a highlighted line, marking the current word differently
-        when using Edge TTS (true word events).  Falls back to whole-line
-        highlight for engines that only have sentence-level timing.
-        """
-        if not line:
-            return
-        use_word_hl = (engine == "edge-tts")
-        normal_hl   = self._cp("hl", bold=True)
-        word_hl     = self._cp("playing", bold=True)
-
-        if not use_word_hl or word_col <= 0:
-            self._sa(y, x, line.ljust(width)[:width], normal_hl)
-            return
-
-        # Find the word boundary at word_col within this line
-        stripped = line.rstrip()
-        col = min(word_col, len(stripped))
-        # Expand to full word boundaries
-        ws = col
-        while ws > 0 and stripped[ws-1] not in (' ', '	'):
-            ws -= 1
-        we = col
-        while we < len(stripped) and stripped[we] not in (' ', '	'):
-            we += 1
-        if ws >= we:
-            self._sa(y, x, line.ljust(width)[:width], normal_hl)
-            return
-        # Render: [before][WORD][after]
-        before = line[:ws]
-        word   = line[ws:we]
-        after  = line[we:]
-        H, W = self.scr.getmaxyx()
-        cx = x
-        if before and cx < W - 1:
-            self._sa(y, cx, before[:width], normal_hl)
-            cx += len(before)
-        if word and cx < W - 1:
-            self._sa(y, cx, word[:max(0,width-(cx-x))], word_hl)
-            cx += len(word)
-        if after and cx < W - 1:
-            rem = max(0, width - (cx - x))
-            self._sa(y, cx, after[:rem].ljust(rem), normal_hl)
 
     # ── Reading scenario detection ────────────────────────────────────────────
 
@@ -1930,10 +1880,9 @@ class TUI:
         maxs  = max(0, len(lines) - vis)
         self.view_scroll = min(self.view_scroll, maxs)
 
-        hl = -1; hl_col = 0
+        hl = -1
         if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            hl_col = self._char_to_col(self.player.est_char_pos, lines, hl)
             if self._autoscroll:
                 mg = 3
                 if hl < self.view_scroll + mg:
@@ -1941,7 +1890,6 @@ class TUI:
                 elif hl >= self.view_scroll + vis - mg:
                     self.view_scroll = min(maxs, hl - vis + mg + 1)
 
-        engine = self.cfg.get("engine", "edge-tts")
         for row in range(vis):
             lidx = self.view_scroll + row
             y    = inner_top + row
@@ -1951,7 +1899,7 @@ class TUI:
             if not line: continue
             is_head = (lidx == 0 or (lidx > 0 and not lines[lidx-1].strip()))
             if lidx == hl:
-                self._render_hl_line(y, inner_x, line, inner_w, hl_col, engine)
+                self._sa(y, inner_x, line.ljust(inner_w)[:inner_w], self._cp("hl", bold=True))
             elif is_head:
                 self._sa(y, inner_x, line[:inner_w], self._cp("accent", bold=True))
             else:
@@ -1998,11 +1946,9 @@ class TUI:
         maxs       = max(0, len(lines) - total_vis)
         self._snake_scroll = min(self._snake_scroll, maxs)
 
-        hl = -1; hl_col = 0
+        hl = -1
         if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            hl_col = self._char_to_col(self.player.est_char_pos, lines, hl)
-            # Autoscroll: keep hl visible across the combined 2-column view
             if self._autoscroll:
                 mg = 3
                 if hl < self._snake_scroll + mg:
@@ -2013,7 +1959,7 @@ class TUI:
         self._render_snake_columns(
             lines, top + 1, vis_rows,
             [(col1_x, inner_w), (col2_x, inner_w)],
-            self._snake_scroll, hl, hl_col, self.cfg.get("engine", "edge-tts")
+            self._snake_scroll, hl
         )
 
         # Scroll %
@@ -2062,10 +2008,9 @@ class TUI:
         maxs       = max(0, len(lines) - total_vis)
         self._snake_scroll = min(self._snake_scroll, maxs)
 
-        hl = -1; hl_col = 0
+        hl = -1
         if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            hl_col = self._char_to_col(self.player.est_char_pos, lines, hl)
             if self._autoscroll:
                 mg = 3
                 if hl < self._snake_scroll + mg:
@@ -2076,7 +2021,7 @@ class TUI:
         self._render_snake_columns(
             lines, top + 1, vis_rows,
             [(col1_x, inner_w), (col2_x, inner_w), (col3_x, inner_w)],
-            self._snake_scroll, hl, hl_col, self.cfg.get("engine", "edge-tts")
+            self._snake_scroll, hl
         )
 
         if len(lines) > total_vis:
@@ -2086,15 +2031,12 @@ class TUI:
     # ── Snake column renderer (shared by S2 and S3) ───────────────────────────
 
     def _render_snake_columns(self, lines: list, top: int, vis_rows: int,
-                              columns: list, scroll: int, hl: int,
-                              hl_col: int = 0, engine: str = "edge-tts"):
+                              columns: list, scroll: int, hl: int):
         """
         Render lines into N columns sequentially (snake-flow).
         columns: list of (x_pos, inner_width) tuples.
         scroll:  starting line index in `lines`.
         hl:      highlighted line index (absolute in `lines`), or -1.
-        hl_col:  column offset within the hl line for word highlighting.
-        engine:  active engine name (word-hl only for edge-tts).
         """
         for col_idx, (cx, cw) in enumerate(columns):
             for row in range(vis_rows):
@@ -2107,7 +2049,7 @@ class TUI:
                     continue
                 is_head = (lidx == 0 or (lidx > 0 and not lines[lidx - 1].strip()))
                 if lidx == hl:
-                    self._render_hl_line(y, cx, line, cw, hl_col, engine)
+                    self._sa(y, cx, line.ljust(cw)[:cw], self._cp("hl", bold=True))
                 elif is_head:
                     self._sa(y, cx, line[:cw], self._cp("accent", bold=True))
                 else:
