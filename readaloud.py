@@ -61,11 +61,16 @@ class EdgeTTSBackend(BaseTTSBackend):
     def generate_chunk_with_timing(self, text: str, voice: str, speed: float,
                                     output_path: str) -> tuple:
         """Returns (success, timing_map).
-        timing_map is a list of (audio_time_seconds, char_offset_in_text) sorted by time.
-        Uses edge_tts.Communicate.stream() for word-boundary events when available.
-        Falls back to CLI (no timing data) if the library is absent.
+        timing_map is [(audio_time_secs, char_offset_in_text), ...] sorted by time.
+
+        The edge_tts Python library WordBoundary chunk has keys:
+            type, offset (100ns ticks), duration (100ns), text (word string)
+        It does NOT have text_offset — we recover char position by scanning
+        forward through the input text, matching each word in sequence.
+
+        Falls back to CLI (no timing data → duration-map fallback) if import fails.
         """
-        # ── Try library path (word-level timing) ─────────────────────────────
+        # ── Library path: true word-level timing ─────────────────────────────
         try:
             import edge_tts
             import asyncio
@@ -75,19 +80,31 @@ class EdgeTTSBackend(BaseTTSBackend):
             async def _stream():
                 communicate = edge_tts.Communicate(text, voice)
                 audio_bytes = bytearray()
+                search_pos = 0   # scan cursor in `text`
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
                         audio_bytes.extend(chunk["data"])
                     elif chunk["type"] == "WordBoundary":
-                        # offset is in 100-nanosecond ticks; char offset in text
-                        audio_secs  = chunk["offset"] / 10_000_000.0
-                        char_offset = chunk.get("text_offset", 0)
-                        timing_map.append((audio_secs, char_offset))
+                        audio_secs = chunk["offset"] / 10_000_000.0
+                        word = chunk.get("text", "")
+                        if word:
+                            # Find this word's position in text, scanning forward
+                            # from where we last matched to stay in sequence.
+                            idx = text.find(word, search_pos)
+                            if idx == -1:
+                                # Case-insensitive fallback
+                                idx = text.lower().find(word.lower(), search_pos)
+                            if idx != -1:
+                                timing_map.append((audio_secs, idx))
+                                search_pos = idx + len(word)
+                            else:
+                                # Word not found (punctuation artefact) — use last pos
+                                timing_map.append((audio_secs, search_pos))
                 with open(output_path, "wb") as f:
                     f.write(audio_bytes)
 
             asyncio.run(_stream())
-            log.debug("EdgeTTS stream: %d word events for %d chars", len(timing_map), len(text))
+            log.debug("EdgeTTS WB: %d word events, %d chars", len(timing_map), len(text))
             return True, timing_map
 
         except ImportError:
@@ -96,7 +113,7 @@ class EdgeTTSBackend(BaseTTSBackend):
             log.error("EdgeTTS stream error: %s", e)
             return False, []
 
-        # ── CLI fallback (no timing data) ─────────────────────────────────────
+        # ── CLI fallback — no word events; _build_timing_map used by caller ──
         try:
             subprocess.run(
                 ["pipx", "run", "edge-tts",
@@ -981,15 +998,15 @@ class Player:
                 backend = mgr._backends["edge-tts"]
                 ok, wb_events = backend.generate_chunk_with_timing(chunk, voice, speed, outfile)
                 if ok and wb_events:
-                    # Translate chunk-relative char offsets to full-text offsets
-                    # and accumulate chunk audio time offset
+                    # chunk_audio_start: cumulative playback time of prior chunks
+                    # WB offset `t` is raw audio time (pre-atempo) → divide by speed
                     chunk_audio_start = sum(
                         _audio_duration(audio_files[j]) / speed
                         for j in range(len(audio_files))
                     ) if audio_files else 0.0
                     for (t, c) in wb_events:
                         edge_wb_map.append((
-                            chunk_audio_start + t,
+                            chunk_audio_start + t / speed,
                             chunk_char_offsets[i] + c
                         ))
             else:
@@ -1361,7 +1378,7 @@ class PreloadCache:
                     ) if audio_files else 0.0
                     for (t, c) in wb_events:
                         edge_wb_map.append((
-                            chunk_audio_start + t,
+                            chunk_audio_start + t / speed,
                             chunk_char_offsets[i] + c
                         ))
             else:
@@ -1607,6 +1624,57 @@ class TUI:
             if total >= pos:
                 return i
         return len(lines) - 1
+
+    def _char_to_col(self, pos, lines, line_idx: int) -> int:
+        """Return the column offset within lines[line_idx] for char pos."""
+        # Cumulative chars before line_idx
+        before = sum(len(l.strip()) + 1 for l in lines[:line_idx])
+        return max(0, pos - before)
+
+    def _render_hl_line(self, y: int, x: int, line: str, width: int,
+                        word_col: int, engine: str):
+        """Render a highlighted line, marking the current word differently
+        when using Edge TTS (true word events).  Falls back to whole-line
+        highlight for engines that only have sentence-level timing.
+        """
+        if not line:
+            return
+        use_word_hl = (engine == "edge-tts")
+        normal_hl   = self._cp("hl", bold=True)
+        word_hl     = self._cp("playing", bold=True)
+
+        if not use_word_hl or word_col <= 0:
+            self._sa(y, x, line.ljust(width)[:width], normal_hl)
+            return
+
+        # Find the word boundary at word_col within this line
+        stripped = line.rstrip()
+        col = min(word_col, len(stripped))
+        # Expand to full word boundaries
+        ws = col
+        while ws > 0 and stripped[ws-1] not in (' ', '	'):
+            ws -= 1
+        we = col
+        while we < len(stripped) and stripped[we] not in (' ', '	'):
+            we += 1
+        if ws >= we:
+            self._sa(y, x, line.ljust(width)[:width], normal_hl)
+            return
+        # Render: [before][WORD][after]
+        before = line[:ws]
+        word   = line[ws:we]
+        after  = line[we:]
+        H, W = self.scr.getmaxyx()
+        cx = x
+        if before and cx < W - 1:
+            self._sa(y, cx, before[:width], normal_hl)
+            cx += len(before)
+        if word and cx < W - 1:
+            self._sa(y, cx, word[:max(0,width-(cx-x))], word_hl)
+            cx += len(word)
+        if after and cx < W - 1:
+            rem = max(0, width - (cx - x))
+            self._sa(y, cx, after[:rem].ljust(rem), normal_hl)
 
     # ── Reading scenario detection ────────────────────────────────────────────
 
@@ -1862,9 +1930,10 @@ class TUI:
         maxs  = max(0, len(lines) - vis)
         self.view_scroll = min(self.view_scroll, maxs)
 
-        hl = -1
+        hl = -1; hl_col = 0
         if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
+            hl_col = self._char_to_col(self.player.est_char_pos, lines, hl)
             if self._autoscroll:
                 mg = 3
                 if hl < self.view_scroll + mg:
@@ -1872,6 +1941,7 @@ class TUI:
                 elif hl >= self.view_scroll + vis - mg:
                     self.view_scroll = min(maxs, hl - vis + mg + 1)
 
+        engine = self.cfg.get("engine", "edge-tts")
         for row in range(vis):
             lidx = self.view_scroll + row
             y    = inner_top + row
@@ -1881,7 +1951,7 @@ class TUI:
             if not line: continue
             is_head = (lidx == 0 or (lidx > 0 and not lines[lidx-1].strip()))
             if lidx == hl:
-                self._sa(y, inner_x, line.ljust(inner_w)[:inner_w], self._cp("hl", bold=True))
+                self._render_hl_line(y, inner_x, line, inner_w, hl_col, engine)
             elif is_head:
                 self._sa(y, inner_x, line[:inner_w], self._cp("accent", bold=True))
             else:
@@ -1928,13 +1998,13 @@ class TUI:
         maxs       = max(0, len(lines) - total_vis)
         self._snake_scroll = min(self._snake_scroll, maxs)
 
-        hl = -1
+        hl = -1; hl_col = 0
         if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
+            hl_col = self._char_to_col(self.player.est_char_pos, lines, hl)
             # Autoscroll: keep hl visible across the combined 2-column view
             if self._autoscroll:
                 mg = 3
-                # Absolute position of hl in snake flow
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
                 elif hl >= self._snake_scroll + total_vis - mg:
@@ -1943,7 +2013,7 @@ class TUI:
         self._render_snake_columns(
             lines, top + 1, vis_rows,
             [(col1_x, inner_w), (col2_x, inner_w)],
-            self._snake_scroll, hl
+            self._snake_scroll, hl, hl_col, self.cfg.get("engine", "edge-tts")
         )
 
         # Scroll %
@@ -1992,9 +2062,10 @@ class TUI:
         maxs       = max(0, len(lines) - total_vis)
         self._snake_scroll = min(self._snake_scroll, maxs)
 
-        hl = -1
+        hl = -1; hl_col = 0
         if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
             hl = self._char_to_line(self.player.est_char_pos, lines)
+            hl_col = self._char_to_col(self.player.est_char_pos, lines, hl)
             if self._autoscroll:
                 mg = 3
                 if hl < self._snake_scroll + mg:
@@ -2005,7 +2076,7 @@ class TUI:
         self._render_snake_columns(
             lines, top + 1, vis_rows,
             [(col1_x, inner_w), (col2_x, inner_w), (col3_x, inner_w)],
-            self._snake_scroll, hl
+            self._snake_scroll, hl, hl_col, self.cfg.get("engine", "edge-tts")
         )
 
         if len(lines) > total_vis:
@@ -2015,12 +2086,15 @@ class TUI:
     # ── Snake column renderer (shared by S2 and S3) ───────────────────────────
 
     def _render_snake_columns(self, lines: list, top: int, vis_rows: int,
-                              columns: list, scroll: int, hl: int):
+                              columns: list, scroll: int, hl: int,
+                              hl_col: int = 0, engine: str = "edge-tts"):
         """
         Render lines into N columns sequentially (snake-flow).
         columns: list of (x_pos, inner_width) tuples.
         scroll:  starting line index in `lines`.
         hl:      highlighted line index (absolute in `lines`), or -1.
+        hl_col:  column offset within the hl line for word highlighting.
+        engine:  active engine name (word-hl only for edge-tts).
         """
         for col_idx, (cx, cw) in enumerate(columns):
             for row in range(vis_rows):
@@ -2033,7 +2107,7 @@ class TUI:
                     continue
                 is_head = (lidx == 0 or (lidx > 0 and not lines[lidx - 1].strip()))
                 if lidx == hl:
-                    self._sa(y, cx, line.ljust(cw)[:cw], self._cp("hl", bold=True))
+                    self._render_hl_line(y, cx, line, cw, hl_col, engine)
                 elif is_head:
                     self._sa(y, cx, line[:cw], self._cp("accent", bold=True))
                 else:
