@@ -752,6 +752,7 @@ def load_config():
         "zoom": ZOOM_DEFAULT,
         "last_file": None,
         "bookmarks": {},
+        "quotes": {},
         "engine": "edge-tts",
     }
 
@@ -1478,7 +1479,9 @@ class TUI:
         self._last_mouse  = ""
         self._bm_key      = self.filename
         self.cfg.setdefault("bookmarks", {}).setdefault(self._bm_key, [])
+        self.cfg.setdefault("quotes", {}).setdefault(self._bm_key, [])
         self.cfg.setdefault("engine", "edge-tts")
+        self._search_query = ""   # last chapter search query
         self._mgr         = get_manager()
         self._preload     = PreloadCache()
         # Multi-page snake scroll: total line offset across all columns
@@ -1711,6 +1714,8 @@ class TUI:
                 self._draw_rp_voices(rpl, rpw, hh, ch)
             elif self.rpanel == "bookmarks":
                 self._draw_rp_bookmarks(rpl, rpw, hh, ch)
+            elif self.rpanel == "quotes":
+                self._draw_rp_quotes(rpl, rpw, hh, ch)
 
         self._draw_footer(W, H, fh)
         self._draw_float_btns(W, H, fh)
@@ -1741,7 +1746,8 @@ class TUI:
         title   = f"  📖 readaloud  ─  {self.filename}"
         nav_ind = "◀▶" if self.nav_visible else "▶▶"
         rp_ind  = ("V" if self.rpanel=="voices" else
-                   "B" if self.rpanel=="bookmarks" else "·")
+                   "B" if self.rpanel=="bookmarks" else
+                   "Q" if self.rpanel=="quotes" else "·")
         right   = f"[{rp_ind}] {nav_ind}  {tn}  {self.ch_idx+1}/{len(self.chapters)}  "
         self._sa(0, 0,                              title, self._cp("hdr", bold=True))
         self._sa(0, max(len(title)+2, W-len(right)-1), right, self._cp("hdr", bold=True))
@@ -1881,14 +1887,16 @@ class TUI:
         self.view_scroll = min(self.view_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
+        if self._highlight and self.player.state in ("playing", "paused"):
             hl = self._char_to_line(self.player.est_char_pos, lines)
             if self._autoscroll:
                 mg = 3
                 if hl < self.view_scroll + mg:
                     self.view_scroll = max(0, hl - mg)
                 elif hl >= self.view_scroll + vis - mg:
-                    self.view_scroll = min(maxs, hl - vis + mg + 1)
+                    # Page-flip: jump a full page so the highlighted line
+                    # lands near the top of the new page — no eye strain
+                    self.view_scroll = min(maxs, hl - mg)
 
         for row in range(vis):
             lidx = self.view_scroll + row
@@ -1947,14 +1955,14 @@ class TUI:
         self._snake_scroll = min(self._snake_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
+        if self._highlight and self.player.state in ("playing", "paused"):
             hl = self._char_to_line(self.player.est_char_pos, lines)
             if self._autoscroll:
                 mg = 3
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
                 elif hl >= self._snake_scroll + total_vis - mg:
-                    self._snake_scroll = min(maxs, hl - total_vis + mg + 1)
+                    self._snake_scroll = min(maxs, hl - mg)
 
         self._render_snake_columns(
             lines, top + 1, vis_rows,
@@ -2009,14 +2017,14 @@ class TUI:
         self._snake_scroll = min(self._snake_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused") and self.player._timing_map:
+        if self._highlight and self.player.state in ("playing", "paused"):
             hl = self._char_to_line(self.player.est_char_pos, lines)
             if self._autoscroll:
                 mg = 3
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
                 elif hl >= self._snake_scroll + total_vis - mg:
-                    self._snake_scroll = min(maxs, hl - total_vis + mg + 1)
+                    self._snake_scroll = min(maxs, hl - mg)
 
         self._render_snake_columns(
             lines, top + 1, vis_rows,
@@ -2215,8 +2223,9 @@ class TUI:
         KEYS = [
             ("Spc", "play/pause"),  ("Enter", "play ch"),
             ("n/p",  "next/prev"),  ("\\",     "nav"),
-            ("[/]",  "prev/next ❯"),("v",      "voices"),
+            ("f",    "search"),     ("v",      "voices"),
             ("B",    "bookmarks"),  ("b",      "+bookmark"),
+            ("Q",    "quotes"),     ("c",       "+quote"),
             ("s",    "speed"),      ("a",      "align"),
             ("t",    "theme"),      ("z",      "autoscroll"),
             ("h",    "highlight"),  ("g",      "goto"),
@@ -2300,6 +2309,11 @@ class TUI:
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
+        # Solid background fill — paint each interior row to block text behind it
+        bg_attr = self._cp("hdr")
+        for r in range(dh):
+            try: self.scr.addstr(dy+r, dx, " "*dw, bg_attr)
+            except curses.error: pass
         self._sa(dy,      dx, BOX["tl"]+BOX["h"]*(dw-2)+BOX["tr"], self._cp("playing", bold=True))
         self._sa(dy+dh-1, dx, BOX["bl"]+BOX["h"]*(dw-2)+BOX["br"], self._cp("playing", bold=True))
         for r in range(1, dh-1):
@@ -2338,7 +2352,7 @@ class TUI:
             f"  Log        : {LOG_PATH}",
         ]
         for i, row in enumerate(rows[:dh-2]):
-            self._sa(dy+1+i, dx+1, row[:dw-2], self._cp("normal"))
+            self._sa(dy+1+i, dx+1, row[:dw-2], self._cp("hdr"))
 
     # ── Mouse ─────────────────────────────────────────────────────────────────
 
@@ -2416,9 +2430,21 @@ class TUI:
             if self._handle_rp_key(key):
                 return
 
-        if key in (ord('q'), ord('Q')):
+        if key == ord('q'):
             self._preload.invalidate()
             self.player.stop(); self.running = False; return
+
+        if key == ord('Q'):
+            if self.rpanel == "quotes":
+                self.rpanel = None
+                self.focus  = "text"
+            else:
+                self.rpanel = "quotes"
+                self.rp_sel = 0
+                self.rp_scroll = 0
+                self.focus  = "rpanel"
+            self._invalidate()
+            return
 
         if key == ord('?'):
             self._debug = not self._debug; return
@@ -2494,11 +2520,8 @@ class TUI:
                 self._invalidate(); self._play()
             return
 
-        if key == ord(']'):
-            self._skip_sentences(+1); return
-
-        if key == ord('['):
-            self._skip_sentences(-1); return
+        if key in (ord('f'), ord('F')):
+            self._search_chapters(); return
 
         if key in (ord('s'), ord('S')):
             was = self.player.state in ("playing","paused","loading","generating")
@@ -2515,6 +2538,9 @@ class TUI:
                 save_config(self.cfg)
                 log.info("bookmark added ch=%d", self.ch_idx)
             return
+
+        if key == ord('c'):
+            self._save_quote(); return
 
         if key in (ord('a'), ord('A')):
             cur = self.cfg.get("align","left")
@@ -2659,6 +2685,23 @@ class TUI:
                     log.info("bookmark deleted idx=%d", self.rp_sel)
                 return True
 
+        elif self.rpanel == "quotes":
+            quotes = self.cfg.get("quotes", {}).get(self._bm_key, [])
+            if key == curses.KEY_UP:
+                self.rp_sel = max(0, self.rp_sel-1); return True
+            if key == curses.KEY_DOWN:
+                self.rp_sel = min(max(0, len(quotes)-1), self.rp_sel+1); return True
+            if key in (ord('d'), ord('D')):
+                if quotes and self.rp_sel < len(quotes):
+                    quotes.pop(self.rp_sel)
+                    self.rp_sel = max(0, self.rp_sel-1)
+                    self.cfg["quotes"][self._bm_key] = quotes
+                    save_config(self.cfg)
+                    log.info("quote deleted idx=%d", self.rp_sel)
+                return True
+            if key == ord('c'):
+                self._save_quote(); return True
+
         return False
 
     # ── Goto chapter inline prompt ────────────────────────────────────────────
@@ -2688,6 +2731,156 @@ class TUI:
                     self._invalidate(); self._play()
             except ValueError:
                 pass
+
+    # ── Chapter search inline prompt ─────────────────────────────────────────
+
+    def _search_chapters(self):
+        """Fuzzy-search chapter titles; navigate to result on Enter."""
+        H, W = self.scr.getmaxyx()
+        curses.curs_set(1)
+        prompt = " Search chapters: "
+        buf = self._search_query
+
+        def _matches(query):
+            q = query.lower()
+            return [(i, t) for i, (t, _) in enumerate(self.chapters)
+                    if q in t.lower()] if q else []
+
+        sel = 0
+        while True:
+            matches = _matches(buf)
+            # Draw search bar
+            self._sa(H-2, 0, " "*(W-1), self._cp("ftr"))
+            self._sa(H-2, 0, prompt + buf, self._cp("ftr", bold=True))
+            # Draw results above search bar (up to 6)
+            max_res = min(6, len(matches))
+            for ri in range(max_res):
+                idx, title = matches[ri]
+                ry = H - 3 - (max_res - 1 - ri)
+                attr = (self._cp("sel", bold=True) if ri == sel
+                        else self._cp("normal"))
+                line = f"  ch{idx+1:>4}  {title}"
+                self._sa(ry, 0, " "*(W-1), attr)
+                self._sa(ry, 0, line[:W-1], attr)
+            self.scr.move(H-2, len(prompt)+len(buf))
+            self.scr.refresh()
+
+            k = self.scr.getch()
+            if k in (curses.KEY_ENTER, 10, 13):
+                if matches and sel < len(matches):
+                    target, _ = matches[sel]
+                    self._search_query = buf
+                    curses.curs_set(0)
+                    self.player.stop()
+                    self.ch_idx = target
+                    self._invalidate()
+                    self._play()
+                    return
+                break
+            elif k == 27:
+                break
+            elif k == curses.KEY_UP:
+                sel = max(0, sel - 1)
+            elif k == curses.KEY_DOWN:
+                sel = min(max(0, len(matches)-1), sel + 1)
+            elif k in (curses.KEY_BACKSPACE, 127):
+                buf = buf[:-1]; sel = 0
+            elif 32 <= k < 127:
+                buf += chr(k); sel = 0
+        self._search_query = buf
+        curses.curs_set(0)
+
+    # ── Save highlighted sentence as quote ────────────────────────────────────
+
+    def _save_quote(self):
+        """Save the currently highlighted sentence to the quotes list."""
+        if self.player.state not in ("playing", "paused"):
+            return
+        _, text = self.chapters[self.ch_idx]
+        lines = self._tlines
+        if not lines:
+            return
+        hl = self._char_to_line(self.player.est_char_pos, lines)
+        # Collect the highlighted line plus adjacent non-empty lines (full sentence)
+        parts = []
+        # Walk back to start of sentence block
+        i = hl
+        while i > 0 and lines[i-1].strip():
+            i -= 1
+        while i < len(lines) and lines[i].strip():
+            parts.append(lines[i].strip())
+            i += 1
+        if not parts:
+            return
+        quote_text = " ".join(parts)
+        ch_title, _ = self.chapters[self.ch_idx]
+        quotes = self.cfg.setdefault("quotes", {}).setdefault(self._bm_key, [])
+        # Avoid exact duplicates
+        if not any(q["text"] == quote_text for q in quotes):
+            quotes.append({
+                "text":    quote_text,
+                "chapter": self.ch_idx,
+                "title":   ch_title,
+            })
+            save_config(self.cfg)
+            log.info("quote saved ch=%d: %s…", self.ch_idx, quote_text[:40])
+
+    # ── Right panel: quotes ───────────────────────────────────────────────────
+
+    def _draw_rp_quotes(self, left, width, top, height):
+        focused = self.focus == "rpanel"
+        quotes  = self.cfg.get("quotes", {}).get(self._bm_key, [])
+        label   = f" QUOTES ({len(quotes)})"
+        if focused:
+            label += " ←"
+        self._sa(top,   left, label,          self._cp("accent", bold=True))
+        self._sa(top,   left+width-3, "Esc",  self._cp("dim"))
+        self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
+
+        if not quotes:
+            self._sa(top+2, left+1, "No quotes yet.",          self._cp("dim"))
+            self._sa(top+3, left+1, "Pause on a sentence and", self._cp("dim"))
+            self._sa(top+4, left+1, "press q to save it.",     self._cp("dim"))
+        else:
+            visible = height - 5
+            if self.rp_sel < self.rp_scroll:
+                self.rp_scroll = self.rp_sel
+            elif self.rp_sel >= self.rp_scroll + visible:
+                self.rp_scroll = self.rp_sel - visible + 1
+
+            for row in range(visible):
+                idx = self.rp_scroll + row
+                y   = top + 2 + row
+                if idx >= len(quotes) or y >= top + height - 2:
+                    break
+                q    = quotes[idx]
+                # Show first line of quote text, truncated to panel width
+                snippet = q["text"][:width-4]
+                src     = f"ch{q['chapter']+1}"
+                is_sel  = (idx == self.rp_sel and focused)
+                attr    = self._cp("sel", bold=True) if is_sel else self._cp("normal")
+                self._sa(y, left, (f" {src} {snippet}").ljust(width)[:width], attr)
+
+            # Selected quote: show full text in bottom area
+            if quotes and self.rp_sel < len(quotes):
+                q = quotes[self.rp_sel]
+                wrap_w = width - 2
+                full   = q["text"]
+                wlines = []
+                while len(full) > wrap_w:
+                    cut = full.rfind(" ", 0, wrap_w)
+                    if cut == -1: cut = wrap_w
+                    wlines.append(full[:cut])
+                    full = full[cut:].lstrip()
+                wlines.append(full)
+                preview_y = top + 2 + min(visible, len(quotes))
+                self._sa(preview_y, left, BOX["h"]*width, self._cp("dim"))
+                for li, wl in enumerate(wlines[:3]):
+                    self._sa(preview_y + 1 + li, left+1,
+                             wl[:wrap_w], self._cp("playing"))
+
+        hint = " ↑↓:nav  d=del  c=save"
+        self._sa(top+height-1, left, hint[:width], self._cp("dim"))
 
 
 # ─── File picker ─────────────────────────────────────────────────────────────
