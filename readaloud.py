@@ -2383,7 +2383,7 @@ class TUI:
                      self._cp("dim", bold=True))
         else:
             total_ch = len(self.chapters)
-            bw     = min(48, max(20, W // 2 - 8))
+            bw     = min(28, max(16, W // 6))
             filled = int(self.ch_idx/max(1,total_ch-1)*bw)
             bar    = "█"*filled + "░"*(bw-filled)
             bar_label = f"Book [{bar}] {self.ch_idx+1}/{total_ch}"
@@ -2394,22 +2394,24 @@ class TUI:
             self._bar_x1   = 6 + bw     # end of bar
             self._bar_bw   = bw
 
+        # Key bindings: 4 columns, readable labels, symmetric layout
         KEYS = [
-            ("Spc",   "play/pause"), ("Enter",  "play ch"),
-            ("n/p",   "next/prev"),  ("\\",     "nav"),
-            ("[/]",   "skip sent."), ("s",      "speed"),
-            ("v",     "voices"),     ("B",      "bookmarks"),
-            ("b",     "+bookmark"),  ("q",      "quotes"),
-            ("c",     "+quote"),     ("g",      "goto ch"),
-            ("f",     "search"),     ("a",      "align"),
-            ("t",     "theme"),      ("h",      "highlight"),
-            ("z",     "scroll"),     ("Bksp",   "close panel"),
-            ("Esc",   "quit ✓"),     ("C+scrl", "zoom"),
+            ("Space",   "play / pause"),   ("Enter",   "play chapter"),
+            ("n",       "next chapter"),   ("p",       "prev chapter"),
+            ("[  ]",    "skip sentence"),  ("s",       "cycle speed"),
+            ("\\",      "navigation"),     ("Tab",     "cycle focus"),
+            ("v",       "voices"),         ("B",       "bookmarks"),
+            ("b",       "add bookmark"),   ("q",       "quotes"),
+            ("c",       "save quote"),     ("g",       "goto chapter"),
+            ("f",       "search"),         ("a",       "text align"),
+            ("t",       "theme"),          ("h",       "highlight"),
+            ("z",       "auto-scroll"),    ("Bksp",    "close panel"),
+            ("C+scroll","zoom"),           ("Esc",     "quit"),
         ]
-        col_w   = 14
-        cols    = 3
+        col_w   = 18   # wide enough for longest label
+        cols    = 4
         rows_k  = (len(KEYS) + cols - 1) // cols
-        box_w   = col_w * cols + 3
+        box_w   = col_w * cols + cols + 1   # cols+1 for borders + inter-col gaps
         box_h   = rows_k + 2
 
         available_rows = fh - 1
@@ -2417,7 +2419,7 @@ class TUI:
             box_h  = available_rows
             rows_k = box_h - 2
 
-        bx = max(W//3, (W - box_w) // 2)
+        bx = max(W//4, (W - box_w) // 2)
         by = y + 1
 
         if bx + box_w >= W - 14:
