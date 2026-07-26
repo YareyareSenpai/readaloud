@@ -7,9 +7,9 @@ Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 
 Reading Scenarios (auto-selected by panel visibility):
-  Scenario 1 — both panels visible     → 1 bordered reading column (tight space)
+  Scenario 1 — neither panel visible   → 1 bordered reading column
   Scenario 2 — exactly one panel       → 2 snake-flow columns
-  Scenario 3 — neither panel visible   → 3 snake-flow columns (maximum space)
+  Scenario 3 — both panels visible     → 3 snake-flow columns
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
@@ -49,80 +49,17 @@ class BaseTTSBackend:
 
 
 class EdgeTTSBackend(BaseTTSBackend):
-    """Microsoft Edge neural TTS — uses edge_tts Python API for WordBoundary timing.
-    Falls back to CLI subprocess if the import is unavailable.
-    generate_chunk_with_timing() returns (success, [(audio_secs, char_offset), ...]).
-    """
-
+    """Microsoft Edge neural TTS via pipx run edge-tts (online)."""
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
-        ok, _ = self.generate_chunk_with_timing(text, voice, speed, output_path)
-        return ok
-
-    def generate_chunk_with_timing(self, text: str, voice: str, speed: float,
-                                    output_path: str) -> tuple:
-        """Returns (success, timing_map).
-        timing_map is [(audio_time_secs, char_offset_in_text), ...] sorted by time.
-
-        The edge_tts Python library WordBoundary chunk has keys:
-            type, offset (100ns ticks), duration (100ns), text (word string)
-        It does NOT have text_offset — we recover char position by scanning
-        forward through the input text, matching each word in sequence.
-
-        Falls back to CLI (no timing data → duration-map fallback) if import fails.
-        """
-        # ── Library path: true word-level timing ─────────────────────────────
-        try:
-            import edge_tts
-            import asyncio
-
-            timing_map: List[tuple] = []
-
-            async def _stream():
-                communicate = edge_tts.Communicate(text, voice)
-                audio_bytes = bytearray()
-                search_pos = 0   # scan cursor in `text`
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_bytes.extend(chunk["data"])
-                    elif chunk["type"] == "WordBoundary":
-                        audio_secs = chunk["offset"] / 10_000_000.0
-                        word = chunk.get("text", "")
-                        if word:
-                            # Find this word's position in text, scanning forward
-                            # from where we last matched to stay in sequence.
-                            idx = text.find(word, search_pos)
-                            if idx == -1:
-                                # Case-insensitive fallback
-                                idx = text.lower().find(word.lower(), search_pos)
-                            if idx != -1:
-                                timing_map.append((audio_secs, idx))
-                                search_pos = idx + len(word)
-                            else:
-                                # Word not found (punctuation artefact) — use last pos
-                                timing_map.append((audio_secs, search_pos))
-                with open(output_path, "wb") as f:
-                    f.write(audio_bytes)
-
-            asyncio.run(_stream())
-            log.debug("EdgeTTS WB: %d word events, %d chars", len(timing_map), len(text))
-            return True, timing_map
-
-        except ImportError:
-            log.debug("edge_tts library not available, falling back to CLI")
-        except Exception as e:
-            log.error("EdgeTTS stream error: %s", e)
-            return False, []
-
-        # ── CLI fallback — no word events; _build_timing_map used by caller ──
         try:
             subprocess.run(
                 ["pipx", "run", "edge-tts",
                  "--voice", voice, "--text", text, "--write-media", output_path],
                 check=True, capture_output=True, timeout=60)
-            return True, []
+            return True
         except Exception as e:
-            log.error("EdgeTTS CLI error: %s", e)
-            return False, []
+            log.error("EdgeTTS error: %s", e)
+            return False
 
 
 class KokoroBackend(BaseTTSBackend):
@@ -485,6 +422,7 @@ def parse_pdf(path):
         from pdfminer.layout import LTTextContainer
     except ImportError:
         raise ImportError("pdfminer.six not installed — run: pip install pdfminer.six")
+
     pages = []
     for page_layout in extract_pages(path):
         parts = []
@@ -492,6 +430,8 @@ def parse_pdf(path):
             if isinstance(element, LTTextContainer):
                 parts.append(element.get_text())
         pages.append("".join(parts).strip())
+
+    # Group ~10 pages per chapter to keep chunks meaningful
     GROUP = 10
     out, n = [], 1
     for i in range(0, len(pages), GROUP):
@@ -508,8 +448,10 @@ def parse_docx(path):
         import docx
     except ImportError:
         raise ImportError("python-docx not installed — run: pip install python-docx")
+
     doc = docx.Document(path)
     chapters, cur_title, buf = [], "Introduction", []
+
     for para in doc.paragraphs:
         style = para.style.name if para.style else ""
         text  = para.text.strip()
@@ -520,11 +462,15 @@ def parse_docx(path):
             buf = []
         else:
             buf.append(para.text)
+
     if buf and "\n".join(buf).strip():
         chapters.append((cur_title, "\n".join(buf)))
+
+    # Fallback: no headings found — split by paragraph groups
     if not chapters:
         all_text = "\n".join(p.text for p in doc.paragraphs)
         return parse_txt_string(all_text, Path(path).stem)
+
     return [(t, c) for t, c in chapters if len(c.strip()) > 80]
 
 
@@ -738,82 +684,6 @@ _KITTY_DEC   = b"\x1b]30002\x1b\\"
 _KITTY_RESET = b"\x1b]30003\x1b\\"
 
 
-# ─── Keybinds ─────────────────────────────────────────────────────────────────
-# All user-remappable actions. Values are key strings resolved by _key_code().
-# Special names: "esc", "enter", "space", "tab", "backspace",
-#                "up", "down", "left", "right", "pgup", "pgdn".
-# Single printable characters used directly, e.g. "q", "B", "?".
-# To remap, add entries to the "keybinds" dict in config.json.
-# Example: "keybinds": {"quit": "q", "panel_quotes": "Q"}
-
-DEFAULT_KEYBINDS: Dict[str, str] = {
-    # Playback
-    "play_pause":    "space",
-    "play_chapter":  "enter",
-    "next_chapter":  "n",
-    "prev_chapter":  "p",
-    "cycle_speed":   "s",
-    "skip_fwd":      "]",
-    "skip_back":     "[",
-    # Navigation
-    "toggle_nav":    "\\",
-    "goto_chapter":  "g",
-    "search":        "f",
-    "cycle_focus":   "tab",
-    # Display
-    "cycle_align":   "a",
-    "cycle_theme":   "t",
-    "toggle_hl":     "h",
-    "toggle_auto":   "z",
-    # Panels (toggle open/close)
-    "panel_voices":  "v",
-    "panel_bmarks":  "B",
-    "panel_quotes":  "q",
-    "close_panel":   "backspace",
-    # Content
-    "save_quote":    "c",
-    "add_bookmark":  "b",
-    # Meta
-    "toggle_debug":  "?",
-    "quit":          "esc",
-}
-
-
-def _key_code(s: str) -> List[int]:
-    """Resolve a keybind string to a list of matching integer key codes.
-    The handler checks: key in _key_code(binding_string).
-    Returns [] for unrecognised strings (binding effectively disabled).
-    """
-    import curses as _c
-    SPECIAL: Dict[str, List[int]] = {
-        "esc":       [27],
-        "enter":     [_c.KEY_ENTER, 10, 13],
-        "space":     [ord(" ")],
-        "tab":       [9],
-        "backspace": [_c.KEY_BACKSPACE, 127, 8],
-        "up":        [_c.KEY_UP],
-        "down":      [_c.KEY_DOWN],
-        "left":      [_c.KEY_LEFT],
-        "right":     [_c.KEY_RIGHT],
-        "pgup":      [_c.KEY_PPAGE],
-        "pgdn":      [_c.KEY_NPAGE],
-        "delete":    [_c.KEY_DC],
-        "home":      [_c.KEY_HOME],
-        "end":       [_c.KEY_END],
-    }
-    raw = s.strip()
-    canonical = raw.lower() if len(raw) > 1 else raw
-    if canonical in SPECIAL:
-        return SPECIAL[canonical]
-    if len(raw) == 1:
-        codes = [ord(raw)]
-        if raw.isalpha():
-            opp = raw.upper() if raw.islower() else raw.lower()
-            codes.append(ord(opp))
-        return codes
-    return []
-
-
 def load_config():
     if CONFIG_PATH.exists():
         try:
@@ -828,9 +698,7 @@ def load_config():
         "zoom": ZOOM_DEFAULT,
         "last_file": None,
         "bookmarks": {},
-        "quotes": {},
         "engine": "edge-tts",
-        "keybinds": {},
     }
 
 def save_config(cfg):
@@ -913,89 +781,6 @@ def wrap_text(text, width, align):
     return lines
 
 
-def _audio_duration(path: str) -> float:
-    """Return duration in seconds of an audio file.
-    Tries soundfile first (core dep, handles WAV perfectly), then ffprobe for MP3.
-    Returns 0.0 on any error — caller falls back to WPM estimate.
-    """
-    # soundfile handles WAV natively and is a guaranteed core dependency
-    try:
-        import soundfile as sf
-        info = sf.info(path)
-        return info.duration
-    except Exception:
-        pass
-    # ffprobe fallback for MP3 (ships with ffmpeg, same package as ffplay)
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=5)
-        val = result.stdout.strip()
-        if val:
-            return float(val)
-    except Exception:
-        pass
-    return 0.0
-
-
-def _build_timing_map(chunks: List[str], audio_files: List[str],
-                      speed: float) -> List[tuple]:
-    """Build a fine-grained (playback_time_secs, char_offset) timeline.
-
-    For each chunk we measure the actual audio duration (soundfile → ffprobe →
-    WPM fallback), then distribute that duration across the sentences inside the
-    chunk proportionally by word count.  This gives sentence-level granularity
-    even when no word-boundary events are available (offline engines / CLI path).
-
-    atempo compresses playback by 1/speed, so raw_dur is divided by speed.
-    Returns list sorted by time, guaranteed to start with (0.0, 0).
-    """
-    timeline: List[tuple] = [(0.0, 0)]
-    cumulative_time  = 0.0
-    cumulative_chars = 0
-
-    for chunk, afile in zip(chunks, audio_files):
-        raw_dur = _audio_duration(afile)
-        if raw_dur <= 0:
-            words   = len(chunk.split())
-            raw_dur = (words / 140.0) * 60.0
-        playback_dur = raw_dur / speed
-
-        # Split chunk into sentences and distribute duration by word-count weight
-        sentences = re.split(r'(?<=[.!?])\s+', chunk)
-        total_words = max(1, sum(len(s.split()) for s in sentences))
-        pos = cumulative_chars
-        t   = cumulative_time
-        for sent in sentences:
-            w      = len(sent.split())
-            frac   = w / total_words
-            t     += playback_dur * frac
-            pos   += len(sent) + 1
-            timeline.append((t, pos))
-
-        cumulative_time  += playback_dur
-        cumulative_chars += len(chunk) + 1
-
-    return timeline
-
-
-def _lookup_timing(timing_map: List[tuple], elapsed: float) -> int:
-    """Binary-search timing_map for the char offset at `elapsed` seconds.
-    timing_map must be sorted by time (first element of each tuple).
-    """
-    if not timing_map:
-        return 0
-    lo, hi = 0, len(timing_map) - 1
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if timing_map[mid][0] <= elapsed:
-            lo = mid
-        else:
-            hi = mid - 1
-    return timing_map[lo][1]
-
-
 # ─── Player ───────────────────────────────────────────────────────────────────
 
 class Player:
@@ -1007,8 +792,7 @@ class Player:
         self.est_char_pos  = 0
         self.play_start_ts = 0.0
         self.chapter_len   = 0
-        self._chars_per_sec = 11.67   # fallback only; superseded by timing_map
-        self._timing_map: List[tuple] = []   # [(playback_secs, char_offset), ...]
+        self._chars_per_sec = 11.67
         self._proc         = None
         self._thread       = None
         self._stop_evt     = threading.Event()
@@ -1016,10 +800,6 @@ class Player:
         self._pause_ts     = 0.0
         self._paused_total = 0.0
         self.on_done       = None
-        # Seek support: stored after synthesis so seek() can restart ffplay
-        self._playlist_path: Optional[str] = None
-        self._current_speed: float = 1.0
-        self._afchain: List[str] = []          # pre-built atempo filter chain
         # F5-TTS animation
         self._anim_idx     = 0
         self._anim_ts      = 0.0
@@ -1047,8 +827,7 @@ class Player:
 
     def _run(self, text: str, voice: str, speed: float, engine: str):
         mgr = get_manager()
-        is_f5    = (engine == "f5-tts")
-        is_edge  = (engine == "edge-tts")
+        is_f5 = (engine == "f5-tts")
         self.state = "generating" if is_f5 else "loading"
         self.error_msg = ""
         tmpdir = tempfile.mkdtemp(prefix="readaloud_")
@@ -1056,17 +835,8 @@ class Player:
 
         chunks = split_text(text)
         self.total_chunks = len(chunks)
-        audio_files  = []
-        ext          = mgr.output_ext(engine)
-        # Accumulated WordBoundary events from Edge TTS (absolute char offsets)
-        edge_wb_map: List[tuple] = []   # [(audio_secs, char_offset_in_full_text)]
-        chunk_char_offsets: List[int] = []  # where each chunk starts in full text
-
-        # Build chunk start offsets (mirrors split_text logic)
-        pos = 0
-        for chunk in chunks:
-            chunk_char_offsets.append(pos)
-            pos += len(chunk) + 1
+        audio_files = []
+        ext = mgr.output_ext(engine)
 
         for i, chunk in enumerate(chunks):
             if self._stop_evt.is_set():
@@ -1075,25 +845,7 @@ class Player:
             if is_f5:
                 self._tick_anim()
             outfile = os.path.join(tmpdir, f"chunk_{i:04d}{ext}")
-
-            if is_edge:
-                backend = mgr._backends["edge-tts"]
-                ok, wb_events = backend.generate_chunk_with_timing(chunk, voice, speed, outfile)
-                if ok and wb_events:
-                    # chunk_audio_start: cumulative playback time of prior chunks
-                    # WB offset `t` is raw audio time (pre-atempo) → divide by speed
-                    chunk_audio_start = sum(
-                        _audio_duration(audio_files[j]) / speed
-                        for j in range(len(audio_files))
-                    ) if audio_files else 0.0
-                    for (t, c) in wb_events:
-                        edge_wb_map.append((
-                            chunk_audio_start + t / speed,
-                            chunk_char_offsets[i] + c
-                        ))
-            else:
-                ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
-
+            ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
             if not ok:
                 self.state = "error"
                 backend = mgr._backends.get(engine)
@@ -1113,34 +865,22 @@ class Player:
             self._cleanup(tmpdir)
             self.state = "idle"; return
 
-        # Build timing map
-        if is_edge and edge_wb_map:
-            self._timing_map = [(0.0, 0)] + edge_wb_map
-            log.debug("EdgeTTS timing map: %d events", len(self._timing_map))
-        else:
-            self._timing_map = _build_timing_map(chunks, audio_files, speed)
-            log.debug("Duration timing map: %d events", len(self._timing_map))
-
         playlist = os.path.join(tmpdir, "playlist.txt")
         with open(playlist, "w") as f:
             for af in audio_files:
                 f.write(f"file '{af}'\n")
 
-        # Speed filter via atempo
+        # Speed filter: edge-tts uses atempo; wav backends rely on atempo too
         tempo = speed
         chain = []
         while tempo > 2.0:
             chain.append("atempo=2.0"); tempo /= 2.0
         chain.append(f"atempo={tempo:.3f}")
 
-        # Persist so seek() can restart ffplay without re-synthesis
-        self._playlist_path = playlist
-        self._current_speed = speed
-        self._afchain       = chain
-
         self.state = "playing"
         self.play_start_ts = time.time()
-        log.debug("playback start, timing_map entries=%d", len(self._timing_map))
+        self._chars_per_sec = 140 / 60 * 5 * speed
+        log.debug("playback start chars_per_sec=%.1f", self._chars_per_sec)
 
         try:
             self._proc = subprocess.Popen(
@@ -1164,10 +904,9 @@ class Player:
                         self.state = "playing"
                 else:
                     elapsed = time.time() - self.play_start_ts - self._paused_total
-                    self.est_char_pos = min(
-                        _lookup_timing(self._timing_map, elapsed),
-                        self.chapter_len)
-                time.sleep(0.1)
+                    self.est_char_pos = min(int(elapsed * self._chars_per_sec),
+                                           self.chapter_len)
+                time.sleep(0.2)
         except Exception as e:
             self.state = "error"; self.error_msg = str(e)
             log.exception("ffplay error")
@@ -1198,82 +937,32 @@ class Player:
         self.est_char_pos = 0
         log.debug("player stopped")
 
-    def seek(self, target_secs: float):
-        """Restart ffplay at target_secs into the current playlist — no re-synthesis.
-        Uses the stored _playlist_path / _afchain from the most recent synthesis.
-        Falls back silently if no playlist is available.
-        """
-        if not self._playlist_path or not os.path.exists(self._playlist_path):
-            log.warning("seek: no playlist available")
-            return
-        # Kill current ffplay without triggering on_done
-        was_paused = self._pause_evt.is_set()
-        self._pause_evt.clear()
-        self._stop_evt.set()
-        if self._proc and self._proc.poll() is None:
-            try: self._proc.terminate()
-            except: pass
-        # Small wait for the poll loop to exit — don't join the thread
-        time.sleep(0.15)
-        self._stop_evt.clear()
-        if was_paused:
-            self._pause_evt.clear()
-
-        self._paused_total  = 0.0
-        self.play_start_ts  = time.time() - target_secs   # clock appears to start at target
-        # Adjust est_char_pos immediately so highlight snaps to target sentence
-        self.est_char_pos   = min(
-            _lookup_timing(self._timing_map, target_secs),
-            self.chapter_len)
-        self.state = "playing"
-        log.info("seek: restarting ffplay at %.2fs", target_secs)
-
-        try:
-            self._proc = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                 "-ss", f"{target_secs:.3f}",
-                 "-f", "concat", "-safe", "0", "-i", self._playlist_path,
-                 "-af", ",".join(self._afchain)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
-        except Exception as e:
-            self.state = "error"
-            self.error_msg = f"seek ffplay error: {e}"
-            log.error(self.error_msg)
-
     def play_cached(self, playlist: str, audio_dir: str,
-                    chapter_len: int, speed: float,
-                    timing_map: Optional[List[tuple]] = None):
-        """Start playback from a pre-synthesized playlist (cache hit).
-        timing_map, if provided, is used for accurate position tracking.
-        """
+                    chapter_len: int, speed: float):
+        """Start playback from a pre-synthesized playlist (cache hit)."""
         self.stop()
         self._stop_evt.clear()
         self._pause_evt.clear()
         self._paused_total = 0.0
         self.chapter_len   = chapter_len
         self.est_char_pos  = 0
-        self._timing_map   = timing_map or []
         self._thread = threading.Thread(
-            target=self._run_cached, args=(playlist, speed), daemon=True)
+            target=self._run_cached, args=(playlist, audio_dir, speed), daemon=True)
         self._thread.start()
 
-    def _run_cached(self, playlist: str, speed: float):
-        """ffplay loop for a pre-built playlist; uses timing_map for position."""
+    def _run_cached(self, playlist: str, audio_dir: str, speed: float):
+        """ffplay loop for a pre-built playlist; mirrors end of _run()."""
         tempo = speed
         chain = []
         while tempo > 2.0:
             chain.append("atempo=2.0"); tempo /= 2.0
         chain.append(f"atempo={tempo:.3f}")
 
-        self._playlist_path = playlist
-        self._current_speed = speed
-        self._afchain       = chain
-
         self.state = "playing"
         self.play_start_ts = time.time()
+        self._chars_per_sec = 140 / 60 * 5 * speed
         self.error_msg = ""
-        log.debug("play_cached: %s, timing_map entries=%d", playlist, len(self._timing_map))
+        log.debug("play_cached: %s", playlist)
 
         try:
             self._proc = subprocess.Popen(
@@ -1297,15 +986,9 @@ class Player:
                         self.state = "playing"
                 else:
                     elapsed = time.time() - self.play_start_ts - self._paused_total
-                    if self._timing_map:
-                        self.est_char_pos = min(
-                            _lookup_timing(self._timing_map, elapsed),
-                            self.chapter_len)
-                    else:
-                        # Fallback WPM estimate if no timing map saved
-                        cps = 140 / 60 * 5 * speed
-                        self.est_char_pos = min(int(elapsed * cps), self.chapter_len)
-                time.sleep(0.1)
+                    self.est_char_pos = min(int(elapsed * self._chars_per_sec),
+                                           self.chapter_len)
+                time.sleep(0.2)
         except Exception as e:
             self.state = "error"; self.error_msg = str(e)
             log.exception("ffplay cached error")
@@ -1360,24 +1043,13 @@ class PreloadCache:
         entry = CACHE_DIR / self.key(ch_idx, engine, voice, speed)
         return (entry / ".done").exists()
 
-    def get_playlist(self, ch_idx: int, engine: str, voice: str,
-                     speed: float) -> Optional[tuple]:
-        """Return (playlist_path, timing_map) if cache is warm, else None.
-        timing_map may be [] if not saved (old cache entry).
-        """
+    def get_playlist(self, ch_idx: int, engine: str, voice: str, speed: float) -> Optional[str]:
+        """Return path to playlist.txt if cache is warm, else None."""
         entry = CACHE_DIR / self.key(ch_idx, engine, voice, speed)
         pl    = entry / "playlist.txt"
-        if not ((entry / ".done").exists() and pl.exists()):
-            return None
-        timing_map: List[tuple] = []
-        timing_file = entry / "timing.json"
-        if timing_file.exists():
-            try:
-                raw = json.loads(timing_file.read_text())
-                timing_map = [tuple(x) for x in raw]
-            except Exception as e:
-                log.warning("preload: failed to read timing.json ch=%d: %s", ch_idx, e)
-        return str(pl), timing_map
+        if (entry / ".done").exists() and pl.exists():
+            return str(pl)
+        return None
 
     def prime(self, chapters: list, from_idx: int,
               engine: str, voice: str, speed: float):
@@ -1463,11 +1135,10 @@ class PreloadCache:
 
     def _synthesize(self, ch_idx: int, text: str, engine: str,
                     voice: str, speed: float, cancel: threading.Event):
-        mgr      = get_manager()
-        is_edge  = (engine == "edge-tts")
-        k        = self.key(ch_idx, engine, voice, speed)
-        entry    = CACHE_DIR / k
-        done     = entry / ".done"
+        mgr   = get_manager()
+        k     = self.key(ch_idx, engine, voice, speed)
+        entry = CACHE_DIR / k
+        done  = entry / ".done"
 
         # Another process may have already written this entry
         if done.exists():
@@ -1485,15 +1156,7 @@ class PreloadCache:
 
         chunks = split_text(text)
         ext    = mgr.output_ext(engine)
-        audio_files   = []
-        edge_wb_map: List[tuple] = []
-
-        # Build chunk start offsets
-        chunk_char_offsets: List[int] = []
-        pos = 0
-        for chunk in chunks:
-            chunk_char_offsets.append(pos)
-            pos += len(chunk) + 1
+        audio_files = []
 
         for i, chunk in enumerate(chunks):
             if cancel.is_set():
@@ -1501,23 +1164,7 @@ class PreloadCache:
                 log.debug("preload: ch=%d cancelled at chunk %d", ch_idx, i)
                 return
             outfile = str(tmp_entry / f"chunk_{i:04d}{ext}")
-
-            if is_edge:
-                backend = mgr._backends["edge-tts"]
-                ok, wb_events = backend.generate_chunk_with_timing(chunk, voice, speed, outfile)
-                if ok and wb_events:
-                    chunk_audio_start = sum(
-                        _audio_duration(audio_files[j]) / speed
-                        for j in range(len(audio_files))
-                    ) if audio_files else 0.0
-                    for (t, c) in wb_events:
-                        edge_wb_map.append((
-                            chunk_audio_start + t / speed,
-                            chunk_char_offsets[i] + c
-                        ))
-            else:
-                ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
-
+            ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
             if not ok or not os.path.exists(outfile):
                 shutil.rmtree(str(tmp_entry), ignore_errors=True)
                 log.warning("preload: ch=%d synthesis failed chunk %d", ch_idx, i)
@@ -1529,12 +1176,6 @@ class PreloadCache:
             shutil.rmtree(str(tmp_entry), ignore_errors=True)
             return
 
-        # Build and save timing map
-        if is_edge and edge_wb_map:
-            timing_map = [(0.0, 0)] + edge_wb_map
-        else:
-            timing_map = _build_timing_map(chunks, audio_files, speed)
-
         # Write playlist using final paths (after rename)
         final_audio = [str(entry / Path(af).name) for af in audio_files]
         pl_path = tmp_entry / "playlist.txt"
@@ -1542,20 +1183,13 @@ class PreloadCache:
             for af in final_audio:
                 f.write(f"file '{af}'\n")
 
-        timing_path = tmp_entry / "timing.json"
-        try:
-            timing_path.write_text(json.dumps(timing_map))
-        except Exception as e:
-            log.warning("preload: failed to write timing.json ch=%d: %s", ch_idx, e)
-
         # Atomic rename tmp → final
         try:
             if entry.exists():
                 shutil.rmtree(str(entry), ignore_errors=True)
             tmp_entry.rename(entry)
             (entry / ".done").touch()
-            log.info("preload: ch=%d warm (%d chunks, %d timing events, engine=%s)",
-                     ch_idx, len(chunks), len(timing_map), engine)
+            log.info("preload: ch=%d warm (%d chunks, engine=%s)", ch_idx, len(chunks), engine)
         except Exception as e:
             log.warning("preload: rename failed ch=%d: %s", ch_idx, e)
             shutil.rmtree(str(tmp_entry), ignore_errors=True)
@@ -1605,20 +1239,14 @@ class TUI:
         self._t_ch        = -1
         self._t_align     = None
         self._t_width     = -1
-        self._autoscroll  = "page"   # "off" | "creep" | "page"
+        self._autoscroll  = True
         self._highlight   = True
         self._debug       = start_debug
         self._last_key    = ""
         self._last_mouse  = ""
         self._bm_key      = self.filename
         self.cfg.setdefault("bookmarks", {}).setdefault(self._bm_key, [])
-        self.cfg.setdefault("quotes",    {}).setdefault(self._bm_key, [])
         self.cfg.setdefault("engine", "edge-tts")
-        self.cfg.setdefault("keybinds", {})
-        self._search_query = ""
-        # Resolve keybindings: merge user overrides onto defaults
-        _merged_kb = {**DEFAULT_KEYBINDS, **self.cfg.get("keybinds", {})}
-        self._kb   = {action: _key_code(ks) for action, ks in _merged_kb.items()}
         self._mgr         = get_manager()
         self._preload     = PreloadCache()
         # Multi-page snake scroll: total line offset across all columns
@@ -1664,19 +1292,11 @@ class TUI:
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _on_chapter_done(self):
-        # Must not call _play()/_stop() directly — this fires from inside
-        # player._thread; calling stop() there causes a self-join deadlock.
-        # Defer to a fresh daemon thread so we're safely outside _thread.
-        def _deferred():
-            with self._lock:
-                if self.ch_idx < len(self.chapters) - 1:
-                    self.ch_idx += 1
-                    self._invalidate()
-                    self._play()
-                else:
-                    # Last chapter finished — settle to idle cleanly
-                    self.player.state = "idle"
-        threading.Thread(target=_deferred, daemon=True).start()
+        with self._lock:
+            if self.ch_idx < len(self.chapters) - 1:
+                self.ch_idx += 1
+                self._invalidate()
+                self._play()
 
     def _play(self):
         engine = self.cfg.get("engine", "edge-tts")
@@ -1685,73 +1305,17 @@ class TUI:
         _, text = self.chapters[self.ch_idx]
         log.info("play ch=%d engine=%s voice=%s speed=%s", self.ch_idx, engine, voice, speed)
 
-        cached = self._preload.get_playlist(self.ch_idx, engine, voice, speed)
-        if cached:
-            pl, timing_map = cached
-            log.info("preload: cache HIT ch=%d timing_events=%d", self.ch_idx, len(timing_map))
+        pl = self._preload.get_playlist(self.ch_idx, engine, voice, speed)
+        if pl:
+            log.info("preload: cache HIT ch=%d", self.ch_idx)
             self.player.play_cached(pl, str(CACHE_DIR / self._preload.key(
-                self.ch_idx, engine, voice, speed)), len(text), speed, timing_map)
+                self.ch_idx, engine, voice, speed)), len(text), speed)
         else:
             log.info("preload: cache MISS ch=%d — synthesizing live", self.ch_idx)
             self.player.play(text, voice, speed, engine)
 
         # Prime the next PRELOAD_AHEAD chapters in background
         self._preload.prime(self.chapters, self.ch_idx, engine, voice, speed)
-
-    def _skip_sentences(self, delta: int):
-        """Jump forward (delta>0) or backward (delta<0) by |delta| sentences.
-        Uses seek() to restart ffplay at the target timestamp — no re-synthesis.
-        Falls back to re-synthesis only when no timing map is available.
-        Only active while playing or paused.
-        """
-        if self.player.state not in ("playing", "paused"):
-            return
-        _, text = self.chapters[self.ch_idx]
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        if not sentences:
-            return
-
-        # Build cumulative char offsets for each sentence
-        offsets: List[int] = []
-        pos = 0
-        for s in sentences:
-            offsets.append(pos)
-            pos += len(s) + 1
-
-        # Find current sentence from est_char_pos
-        cur_pos = self.player.est_char_pos
-        cur_idx = 0
-        for i, off in enumerate(offsets):
-            if off <= cur_pos:
-                cur_idx = i
-            else:
-                break
-        target_idx  = max(0, min(len(sentences) - 1, cur_idx + delta))
-        target_char = offsets[target_idx]
-        log.info("skip_sentences delta=%d cur=%d target=%d char=%d",
-                 delta, cur_idx, target_idx, target_char)
-
-        tm = self.player._timing_map
-        if tm:
-            # Reverse-lookup: find playback time for target char offset
-            # Walk the timing map forward until we pass target_char
-            target_secs = 0.0
-            for (t, c) in tm:
-                if c <= target_char:
-                    target_secs = t
-                else:
-                    break
-            self.player.seek(target_secs)
-        else:
-            # No timing map (e.g. still loading) — fall back to re-synthesis
-            engine = self.cfg.get("engine", "edge-tts")
-            voice  = current_voice_id(self.cfg)
-            speed  = SPEEDS[self.cfg["speed_index"]]
-            target_text = " ".join(sentences[target_idx:])
-            self.player.stop()
-            self.player.chapter_len  = len(text)
-            self.player.est_char_pos = target_char
-            self.player.play(target_text, voice, speed, engine)
 
     # ── Text helpers ──────────────────────────────────────────────────────────
 
@@ -1781,17 +1345,16 @@ class TUI:
                 return i
         return len(lines) - 1
 
-
     # ── Reading scenario detection ────────────────────────────────────────────
 
     def _reading_scenario(self) -> int:
         """
-        1 → both panels visible    (1 bordered column — tight space between panels)
+        1 → neither panel visible  (1 bordered column)
         2 → exactly one panel      (2 snake columns)
-        3 → neither panel visible  (3 snake columns — maximum space)
+        3 → both panels visible    (3 snake columns)
         """
         panels = (1 if self.nav_visible else 0) + (1 if self.rpanel else 0)
-        if panels == 2:
+        if panels == 0:
             return 1
         elif panels == 1:
             return 2
@@ -1867,8 +1430,6 @@ class TUI:
                 self._draw_rp_voices(rpl, rpw, hh, ch)
             elif self.rpanel == "bookmarks":
                 self._draw_rp_bookmarks(rpl, rpw, hh, ch)
-            elif self.rpanel == "quotes":
-                self._draw_rp_quotes(rpl, rpw, hh, ch)
 
         self._draw_footer(W, H, fh)
         self._draw_float_btns(W, H, fh)
@@ -1899,8 +1460,7 @@ class TUI:
         title   = f"  📖 readaloud  ─  {self.filename}"
         nav_ind = "◀▶" if self.nav_visible else "▶▶"
         rp_ind  = ("V" if self.rpanel=="voices" else
-                   "B" if self.rpanel=="bookmarks" else
-                   "Q" if self.rpanel=="quotes" else "·")
+                   "B" if self.rpanel=="bookmarks" else "·")
         right   = f"[{rp_ind}] {nav_ind}  {tn}  {self.ch_idx+1}/{len(self.chapters)}  "
         self._sa(0, 0,                              title, self._cp("hdr", bold=True))
         self._sa(0, max(len(title)+2, W-len(right)-1), right, self._cp("hdr", bold=True))
@@ -1924,8 +1484,7 @@ class TUI:
               "idle":       self._cp("normal")}.get(state, self._cp("normal"))
         zi   = self.cfg.get("zoom", ZOOM_DEFAULT)
         albl = self.cfg.get("align","left").capitalize()
-        auto = {"off": "─────", "creep": "CREEP↓", "page": "PAGE↓"}.get(
-            self._autoscroll, "─────")
+        auto = "AUTO↓" if self._autoscroll else "─────"
         hl_l = "HL" if self._highlight else "hl"
         dbg  = " DBG" if self._debug else ""
         scn  = f" S{self._reading_scenario()}"
@@ -1994,8 +1553,8 @@ class TUI:
             self._sa(y, 0, line[:width-1], attr)
 
     # ── SCENARIO 1: Single bordered reading column ────────────────────────────
-    # Triggered when BOTH panels are visible (tight space sandwiched between them).
-    # Draws a rounded box around the text area with symmetric padding.
+    # Triggered when NEITHER nav nor rpanel is visible.
+    # Draws a rounded box around the entire text area with symmetric padding.
 
     def _draw_text_scenario1(self, left: int, width: int, top: int, height: int):
         """1-page: bordered reading box, symmetric padding, full content area."""
@@ -2041,20 +1600,14 @@ class TUI:
         self.view_scroll = min(self.view_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused"):
+        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            if self._autoscroll == "creep":
+            if self._autoscroll:
                 mg = 3
                 if hl < self.view_scroll + mg:
                     self.view_scroll = max(0, hl - mg)
                 elif hl >= self.view_scroll + vis - mg:
-                    self.view_scroll = min(maxs, self.view_scroll + 1)
-            elif self._autoscroll == "page":
-                mg = 3
-                if hl < self.view_scroll + mg:
-                    self.view_scroll = max(0, hl - mg)
-                elif hl >= self.view_scroll + vis - mg:
-                    self.view_scroll = min(maxs, hl - mg)
+                    self.view_scroll = min(maxs, hl - vis + mg + 1)
 
         for row in range(vis):
             lidx = self.view_scroll + row
@@ -2113,20 +1666,16 @@ class TUI:
         self._snake_scroll = min(self._snake_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused"):
+        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            if self._autoscroll == "creep":
+            # Autoscroll: keep hl visible across the combined 2-column view
+            if self._autoscroll:
                 mg = 3
+                # Absolute position of hl in snake flow
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
                 elif hl >= self._snake_scroll + total_vis - mg:
-                    self._snake_scroll = min(maxs, self._snake_scroll + 1)
-            elif self._autoscroll == "page":
-                mg = 3
-                if hl < self._snake_scroll + mg:
-                    self._snake_scroll = max(0, hl - mg)
-                elif hl >= self._snake_scroll + total_vis - mg:
-                    self._snake_scroll = min(maxs, hl - mg)
+                    self._snake_scroll = min(maxs, hl - total_vis + mg + 1)
 
         self._render_snake_columns(
             lines, top + 1, vis_rows,
@@ -2140,7 +1689,7 @@ class TUI:
             self._sa(top, left + width - 6, f"{pct:3d}%", self._cp("dim"))
 
     # ── SCENARIO 3: Three snake-flow columns ──────────────────────────────────
-    # Triggered when NEITHER panel is visible (maximum available width).
+    # Triggered when BOTH nav and rpanel are visible.
     # Text flows col1 → col2 → col3 (snake-flow across 3 columns).
 
     def _draw_text_scenario3(self, left: int, width: int, top: int, height: int, W: int):
@@ -2181,20 +1730,14 @@ class TUI:
         self._snake_scroll = min(self._snake_scroll, maxs)
 
         hl = -1
-        if self._highlight and self.player.state in ("playing", "paused"):
+        if self._highlight and self.player.state in ("playing", "paused") and self.player.est_char_pos > 0:
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            if self._autoscroll == "creep":
+            if self._autoscroll:
                 mg = 3
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
                 elif hl >= self._snake_scroll + total_vis - mg:
-                    self._snake_scroll = min(maxs, self._snake_scroll + 1)
-            elif self._autoscroll == "page":
-                mg = 3
-                if hl < self._snake_scroll + mg:
-                    self._snake_scroll = max(0, hl - mg)
-                elif hl >= self._snake_scroll + total_vis - mg:
-                    self._snake_scroll = min(maxs, hl - mg)
+                    self._snake_scroll = min(maxs, hl - total_vis + mg + 1)
 
         self._render_snake_columns(
             lines, top + 1, vis_rows,
@@ -2391,16 +1934,13 @@ class TUI:
                      self._cp("playing"))
 
         KEYS = [
-            ("Spc",   "play/pause"),  ("Enter",  "play ch"),
-            ("n/p",   "next/prev"),   ("\\",     "nav"),
-            ("[/]",   "skip sent."),  ("v",      "voices"),
-            ("B",     "bookmarks"),   ("b",      "+bookmark"),
-            ("q",     "quotes"),      ("c",      "+quote"),
-            ("s",     "speed"),       ("a",      "align"),
-            ("t",     "theme"),       ("z",      "scroll mode"),
-            ("h",     "highlight"),   ("g",      "goto"),
-            ("f",     "search"),      ("Bksp",   "close panel"),
-            ("Esc",   "quit"),        ("C+scroll","zoom"),
+            ("Spc", "play/pause"),  ("Enter", "play ch"),
+            ("n/p",  "next/prev"),  ("\\",     "nav"),
+            ("v",    "voices"),     ("B",      "bookmarks"),
+            ("b",    "+bookmark"),  ("s",      "speed"),
+            ("a",    "align"),      ("t",      "theme"),
+            ("z",    "autoscroll"), ("h",      "highlight"),
+            ("g",    "goto"),       ("C+scroll","zoom"),
         ]
         col_w   = 18
         cols    = 2
@@ -2480,17 +2020,12 @@ class TUI:
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
-        # Flood-fill interior with solid hdr background so nothing bleeds through
-        bg_attr = self._cp("hdr")
-        for r in range(dh):
-            try: self.scr.addstr(dy+r, dx, " "*dw, bg_attr)
-            except curses.error: pass
         self._sa(dy,      dx, BOX["tl"]+BOX["h"]*(dw-2)+BOX["tr"], self._cp("playing", bold=True))
         self._sa(dy+dh-1, dx, BOX["bl"]+BOX["h"]*(dw-2)+BOX["br"], self._cp("playing", bold=True))
         for r in range(1, dh-1):
             self._sa(dy+r, dx,      BOX["v"], self._cp("playing", bold=True))
             self._sa(dy+r, dx+dw-1, BOX["v"], self._cp("playing", bold=True))
-        self._sa(dy, dx+2, " DEBUG  (Bksp to close) ", self._cp("playing", bold=True))
+        self._sa(dy, dx+2, " DEBUG  (? to close) ", self._cp("playing", bold=True))
 
         eng_avail = {k: v for k, v in self._mgr.availability.items()}
         engine = self.cfg.get('engine', 'edge-tts')
@@ -2523,7 +2058,7 @@ class TUI:
             f"  Log        : {LOG_PATH}",
         ]
         for i, row in enumerate(rows[:dh-2]):
-            self._sa(dy+1+i, dx+1, row[:dw-2], self._cp("hdr"))
+            self._sa(dy+1+i, dx+1, row[:dw-2], self._cp("normal"))
 
     # ── Mouse ─────────────────────────────────────────────────────────────────
 
@@ -2590,10 +2125,6 @@ class TUI:
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
 
-    def _kb_match(self, key: int, action: str) -> bool:
-        """Return True if key matches the resolved codes for action."""
-        return key in self._kb.get(action, [])
-
     def _handle_key(self, key):
         if key == -1: return
         try:
@@ -2605,97 +2136,41 @@ class TUI:
             if self._handle_rp_key(key):
                 return
 
-        kb = self._kb_match
-
-        # ── Quit (Esc by default; user can remap to "q" via keybinds) ─────────
-        if kb(key, "quit"):
+        if key in (ord('q'), ord('Q')):
             self._preload.invalidate()
             self.player.stop(); self.running = False; return
 
-        # ── Meta ───────────────────────────────────────────────────────────────
-        if kb(key, "toggle_debug"):
+        if key == ord('?'):
             self._debug = not self._debug; return
 
-        # ── Display ────────────────────────────────────────────────────────────
-        if kb(key, "toggle_hl"):
+        if key in (ord('h'), ord('H')):
             self._highlight = not self._highlight; return
 
-        if kb(key, "cycle_align"):
-            cur = self.cfg.get("align","left")
-            self.cfg["align"] = ALIGN_ORDER[(ALIGN_ORDER.index(cur)+1) % len(ALIGN_ORDER)]
-            save_config(self.cfg); self._invalidate(); return
-
-        if kb(key, "cycle_theme"):
-            cur = self.cfg.get("theme","terminal")
-            idx = THEME_ORDER.index(cur) if cur in THEME_ORDER else 0
-            self.cfg["theme"] = THEME_ORDER[(idx+1) % len(THEME_ORDER)]
-            save_config(self.cfg); self._setup_colors(); return
-
-        if kb(key, "toggle_auto"):
-            cycle = {"off": "creep", "creep": "page", "page": "off"}
-            self._autoscroll = cycle.get(self._autoscroll, "page"); return
-
-        # ── Playback ───────────────────────────────────────────────────────────
-        if kb(key, "play_pause"):
+        if key == ord(' '):
             if self.player.state in ("playing","paused"):
                 self.player.toggle_pause()
             else:
                 self._play()
             return
 
-        if kb(key, "play_chapter"):
+        if key in (curses.KEY_ENTER, 10, 13):
             self.player.stop(); self._play(); return
 
-        if kb(key, "next_chapter"):
-            if self.ch_idx < len(self.chapters)-1:
-                self.player.stop()
-                self.ch_idx += 1
-                self._invalidate(); self._play()
-            return
-
-        if kb(key, "prev_chapter"):
-            if self.ch_idx > 0:
-                self.player.stop()
-                self.ch_idx -= 1
-                self._invalidate(); self._play()
-            return
-
-        if kb(key, "skip_fwd"):
-            self._skip_sentences(+1); return
-
-        if kb(key, "skip_back"):
-            self._skip_sentences(-1); return
-
-        if kb(key, "cycle_speed"):
-            was = self.player.state in ("playing","paused","loading","generating")
-            self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
-            save_config(self.cfg)
-            self._preload.invalidate()
-            if was: self.player.stop(); self._play()
-            return
-
-        # ── Navigation ─────────────────────────────────────────────────────────
-        if kb(key, "toggle_nav"):
-            self.nav_visible = not self.nav_visible
-            self._invalidate(); return
-
-        if kb(key, "cycle_focus"):
+        if key == ord('\t'):
             order = ["chapters","text"]
             if self.rpanel: order.append("rpanel")
             cur = self.focus if self.focus in order else "chapters"
             self.focus = order[(order.index(cur)+1) % len(order)]
             return
 
-        if kb(key, "goto_chapter"):
-            self._goto_chapter(); return
+        if key == ord('\\'):
+            self.nav_visible = not self.nav_visible
+            self._invalidate(); return
 
-        if kb(key, "search"):
-            self._search_chapters(); return
-
-        # ── Panels ─────────────────────────────────────────────────────────────
-        if kb(key, "panel_voices"):
+        if key in (ord('v'), ord('V')):
             if self.rpanel == "voices":
-                self.rpanel = None; self.focus = "text"
+                self.rpanel = None
+                self.focus  = "text"
             else:
                 self.rpanel = "voices"
                 self._rp_section = "engine"
@@ -2703,36 +2178,51 @@ class TUI:
                 self._voice_sel  = self.cfg.get("voice_index", 0)
                 self.rp_scroll   = 0
                 self.focus       = "rpanel"
-            self._invalidate(); return
-
-        if kb(key, "panel_bmarks"):
-            if self.rpanel == "bookmarks":
-                self.rpanel = None; self.focus = "text"
-            else:
-                self.rpanel = "bookmarks"
-                self.rp_sel = 0; self.rp_scroll = 0
-                self.focus  = "rpanel"
-            self._invalidate(); return
-
-        if kb(key, "panel_quotes"):
-            if self.rpanel == "quotes":
-                self.rpanel = None; self.focus = "text"
-            else:
-                self.rpanel = "quotes"
-                self.rp_sel = 0; self.rp_scroll = 0
-                self.focus  = "rpanel"
-            self._invalidate(); return
-
-        if kb(key, "close_panel"):
-            if self.rpanel:
-                self.rpanel = None; self.focus = "text"
-                self._invalidate()
-            elif self._debug:
-                self._debug = False
+            self._invalidate()
             return
 
-        # ── Content ────────────────────────────────────────────────────────────
-        if kb(key, "add_bookmark"):
+        if key in (ord('B'),):
+            if self.rpanel == "bookmarks":
+                self.rpanel = None
+                self.focus  = "text"
+            else:
+                self.rpanel = "bookmarks"
+                self.rp_sel = 0
+                self.rp_scroll = 0
+                self.focus  = "rpanel"
+            self._invalidate()
+            return
+
+        if key == 27:
+            if self.rpanel:
+                self.rpanel = None
+                self.focus  = "text"
+                self._invalidate()
+            return
+
+        if key in (ord('n'), ord('N')):
+            if self.ch_idx < len(self.chapters)-1:
+                self.player.stop()
+                self.ch_idx += 1
+                self._invalidate(); self._play()
+            return
+
+        if key in (ord('p'), ord('P')):
+            if self.ch_idx > 0:
+                self.player.stop()
+                self.ch_idx -= 1
+                self._invalidate(); self._play()
+            return
+
+        if key in (ord('s'), ord('S')):
+            was = self.player.state in ("playing","paused","loading","generating")
+            self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
+            save_config(self.cfg)
+            self._preload.invalidate()
+            if was: self.player.stop(); self._play()
+            return
+
+        if key == ord('b'):
             bms = self.cfg["bookmarks"].setdefault(self._bm_key, [])
             if not any(bm["chapter"] == self.ch_idx for bm in bms):
                 bms.append({"chapter": self.ch_idx, "note": ""})
@@ -2740,8 +2230,24 @@ class TUI:
                 log.info("bookmark added ch=%d", self.ch_idx)
             return
 
-        if kb(key, "save_quote"):
-            self._save_quote(); return
+        if key in (ord('a'), ord('A')):
+            cur = self.cfg.get("align","left")
+            self.cfg["align"] = ALIGN_ORDER[(ALIGN_ORDER.index(cur)+1) % len(ALIGN_ORDER)]
+            save_config(self.cfg)
+            self._invalidate(); return
+
+        if key in (ord('t'), ord('T')):
+            cur = self.cfg.get("theme","terminal")
+            idx = THEME_ORDER.index(cur) if cur in THEME_ORDER else 0
+            self.cfg["theme"] = THEME_ORDER[(idx+1) % len(THEME_ORDER)]
+            save_config(self.cfg)
+            self._setup_colors(); return
+
+        if key in (ord('z'), ord('Z')):
+            self._autoscroll = not self._autoscroll; return
+
+        if key in (ord('g'), ord('G')):
+            self._goto_chapter(); return
 
         # Arrow keys — scenario-aware scrolling
         scenario = self._reading_scenario()
@@ -2787,8 +2293,7 @@ class TUI:
 
     def _handle_rp_key(self, key) -> bool:
         """Handle key when right panel is focused. Returns True if consumed."""
-        # Backspace closes the panel (Esc is now quit; backspace is close_panel)
-        if key in self._kb.get("close_panel", []):
+        if key == 27:
             self.rpanel = None; self.focus = "text"
             self._invalidate()
             return True
@@ -2868,23 +2373,6 @@ class TUI:
                     log.info("bookmark deleted idx=%d", self.rp_sel)
                 return True
 
-        elif self.rpanel == "quotes":
-            quotes = self.cfg.get("quotes", {}).get(self._bm_key, [])
-            if key == curses.KEY_UP:
-                self.rp_sel = max(0, self.rp_sel-1); return True
-            if key == curses.KEY_DOWN:
-                self.rp_sel = min(max(0, len(quotes)-1), self.rp_sel+1); return True
-            if key in (ord('d'), ord('D')):
-                if quotes and self.rp_sel < len(quotes):
-                    quotes.pop(self.rp_sel)
-                    self.rp_sel = max(0, self.rp_sel-1)
-                    self.cfg.setdefault("quotes", {})[self._bm_key] = quotes
-                    save_config(self.cfg)
-                    log.info("quote deleted idx=%d", self.rp_sel)
-                return True
-            if key in self._kb.get("save_quote", []):
-                self._save_quote(); return True
-
         return False
 
     # ── Goto chapter inline prompt ────────────────────────────────────────────
@@ -2914,142 +2402,6 @@ class TUI:
                     self._invalidate(); self._play()
             except ValueError:
                 pass
-
-
-    # ── Chapter search inline prompt ─────────────────────────────────────────
-
-    def _search_chapters(self):
-        """Fuzzy-search chapter titles; navigate to result on Enter."""
-        H, W = self.scr.getmaxyx()
-        curses.curs_set(1)
-        prompt = " Search chapters: "
-        buf = self._search_query
-
-        def _matches(query):
-            q = query.lower()
-            return [(i, t) for i, (t, _) in enumerate(self.chapters)
-                    if q in t.lower()] if q else []
-
-        sel = 0
-        while True:
-            matches = _matches(buf)
-            self._sa(H-2, 0, " "*(W-1), self._cp("ftr"))
-            self._sa(H-2, 0, prompt + buf, self._cp("ftr", bold=True))
-            max_res = min(6, len(matches))
-            for ri in range(max_res):
-                idx, title = matches[ri]
-                ry = H - 3 - (max_res - 1 - ri)
-                attr = self._cp("sel", bold=True) if ri == sel else self._cp("normal")
-                line = f"  ch{idx+1:>4}  {title}"
-                self._sa(ry, 0, " "*(W-1), attr)
-                self._sa(ry, 0, line[:W-1], attr)
-            self.scr.move(H-2, len(prompt)+len(buf))
-            self.scr.refresh()
-
-            k = self.scr.getch()
-            if k in (curses.KEY_ENTER, 10, 13):
-                if matches and sel < len(matches):
-                    target, _ = matches[sel]
-                    self._search_query = buf
-                    curses.curs_set(0)
-                    self.player.stop()
-                    self.ch_idx = target
-                    self._invalidate()
-                    self._play()
-                    return
-                break
-            elif k == 27 or k in self._kb.get("close_panel", []):
-                break
-            elif k == curses.KEY_UP:
-                sel = max(0, sel - 1)
-            elif k == curses.KEY_DOWN:
-                sel = min(max(0, len(matches)-1), sel + 1)
-            elif k in (curses.KEY_BACKSPACE, 127, 8):
-                buf = buf[:-1]; sel = 0
-            elif 32 <= k < 127:
-                buf += chr(k); sel = 0
-        self._search_query = buf
-        curses.curs_set(0)
-
-    # ── Save highlighted sentence as quote ────────────────────────────────────
-
-    def _save_quote(self):
-        """Save the currently highlighted sentence to the quotes list."""
-        if self.player.state not in ("playing", "paused"):
-            return
-        _, text = self.chapters[self.ch_idx]
-        lines = self._tlines
-        if not lines:
-            return
-        hl = self._char_to_line(self.player.est_char_pos, lines)
-        # Walk back to sentence start, then collect until blank
-        i = hl
-        while i > 0 and lines[i-1].strip():
-            i -= 1
-        parts = []
-        while i < len(lines) and lines[i].strip():
-            parts.append(lines[i].strip())
-            i += 1
-        if not parts:
-            return
-        quote_text = " ".join(parts)
-        ch_title, _ = self.chapters[self.ch_idx]
-        quotes = self.cfg.setdefault("quotes", {}).setdefault(self._bm_key, [])
-        if not any(q["text"] == quote_text for q in quotes):
-            quotes.append({"text": quote_text, "chapter": self.ch_idx, "title": ch_title})
-            save_config(self.cfg)
-            log.info("quote saved ch=%d: %s…", self.ch_idx, quote_text[:40])
-
-    # ── Right panel: quotes ───────────────────────────────────────────────────
-
-    def _draw_rp_quotes(self, left, width, top, height):
-        focused = self.focus == "rpanel"
-        quotes  = self.cfg.get("quotes", {}).get(self._bm_key, [])
-        label   = f" QUOTES ({len(quotes)})" + (" ←" if focused else "")
-        self._sa(top,   left, label,          self._cp("accent", bold=True))
-        self._sa(top,   left+width-3, "Bksp", self._cp("dim"))
-        self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
-
-        if not quotes:
-            self._sa(top+2, left+1, "No quotes yet.",          self._cp("dim"))
-            self._sa(top+3, left+1, "While playing press c",   self._cp("dim"))
-            self._sa(top+4, left+1, "to capture a sentence.",  self._cp("dim"))
-        else:
-            visible = height - 6
-            if self.rp_sel < self.rp_scroll:
-                self.rp_scroll = self.rp_sel
-            elif self.rp_sel >= self.rp_scroll + visible:
-                self.rp_scroll = self.rp_sel - visible + 1
-            for row in range(visible):
-                idx = self.rp_scroll + row
-                y   = top + 2 + row
-                if idx >= len(quotes) or y >= top + height - 3:
-                    break
-                q       = quotes[idx]
-                snippet = q["text"][:width-6]
-                src     = f"ch{q['chapter']+1}"
-                is_sel  = (idx == self.rp_sel and focused)
-                attr    = self._cp("sel", bold=True) if is_sel else self._cp("normal")
-                self._sa(y, left, (f" {src} {snippet}").ljust(width)[:width], attr)
-            # Expanded preview of selected quote
-            if quotes and self.rp_sel < len(quotes):
-                q      = quotes[self.rp_sel]
-                wrap_w = width - 2
-                full   = q["text"]
-                wlines = []
-                while len(full) > wrap_w:
-                    cut = full.rfind(" ", 0, wrap_w)
-                    if cut == -1: cut = wrap_w
-                    wlines.append(full[:cut])
-                    full = full[cut:].lstrip()
-                wlines.append(full)
-                py = top + 2 + min(visible, len(quotes))
-                self._sa(py, left, BOX["h"]*width, self._cp("dim"))
-                for li, wl in enumerate(wlines[:3]):
-                    self._sa(py+1+li, left+1, wl[:wrap_w], self._cp("playing"))
-
-        hint = " ↑↓:nav  d=del  c=save"
-        self._sa(top+height-1, left, hint[:width], self._cp("dim"))
 
 
 # ─── File picker ─────────────────────────────────────────────────────────────
