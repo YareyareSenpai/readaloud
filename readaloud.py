@@ -806,11 +806,7 @@ def _key_code(s: str) -> List[int]:
     if canonical in SPECIAL:
         return SPECIAL[canonical]
     if len(raw) == 1:
-        codes = [ord(raw)]
-        if raw.isalpha():
-            opp = raw.upper() if raw.islower() else raw.lower()
-            codes.append(ord(opp))
-        return codes
+        return [ord(raw)]
     return []
 
 
@@ -1616,6 +1612,11 @@ class TUI:
         self.cfg.setdefault("engine", "edge-tts")
         self.cfg.setdefault("keybinds", {})
         self._search_query = ""
+        # Progress bar geometry (set during draw; used by mouse handler)
+        self._bar_y  = 0
+        self._bar_x0 = 6
+        self._bar_x1 = 34
+        self._bar_bw = 28
         # Resolve keybindings: merge user overrides onto defaults
         _merged_kb = {**DEFAULT_KEYBINDS, **self.cfg.get("keybinds", {})}
         self._kb   = {action: _key_code(ks) for action, ks in _merged_kb.items()}
@@ -2240,9 +2241,8 @@ class TUI:
 
         # ── Header ───────────────────────────────────────────────────────────
         label = " ENGINES & VOICES" + (" ←" if focused else "")
-        self._sa(top,   left, label,            self._cp("rpanel", bold=True))
-        self._sa(top,   left+width-3, "Esc",   self._cp("dim"))
-        self._sa(top+1, left, BOX["h"]*width,   self._cp("accent"))
+        self._sa(top,   left, label[:width],     self._cp("rpanel", bold=True))
+        self._sa(top+1, left, BOX["h"]*width,    self._cp("accent"))
 
         row = 2
         # ── Engine section ────────────────────────────────────────────────────
@@ -2332,8 +2332,7 @@ class TUI:
         label = f" BOOKMARKS ({len(bms)})"
         if focused:
             label += " ←"
-        self._sa(top,   left, label,         hattr)
-        self._sa(top,   left+width-3, "Esc", self._cp("dim"))
+        self._sa(top,   left, label[:width],  hattr)
         self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
 
         if not bms:
@@ -2384,26 +2383,31 @@ class TUI:
                      self._cp("dim", bold=True))
         else:
             total_ch = len(self.chapters)
-            bw     = min(28, W//3)
+            bw     = min(48, max(20, W // 2 - 8))
             filled = int(self.ch_idx/max(1,total_ch-1)*bw)
             bar    = "█"*filled + "░"*(bw-filled)
-            self._sa(y+1, 2, f"Book [{bar}] {self.ch_idx+1}/{total_ch}",
-                     self._cp("playing"))
+            bar_label = f"Book [{bar}] {self.ch_idx+1}/{total_ch}"
+            self._sa(y+1, 2, bar_label, self._cp("playing"))
+            # Store bar geometry for mouse hit-testing (x range of the bar itself)
+            self._bar_y    = y + 1
+            self._bar_x0   = 6          # after "Book ["
+            self._bar_x1   = 6 + bw     # end of bar
+            self._bar_bw   = bw
 
         KEYS = [
-            ("Spc",   "play/pause"),  ("Enter",  "play ch"),
-            ("n/p",   "next/prev"),   ("\\",     "nav"),
-            ("[/]",   "skip sent."),  ("v",      "voices"),
-            ("B",     "bookmarks"),   ("b",      "+bookmark"),
-            ("q",     "quotes"),      ("c",      "+quote"),
-            ("s",     "speed"),       ("a",      "align"),
-            ("t",     "theme"),       ("z",      "scroll mode"),
-            ("h",     "highlight"),   ("g",      "goto"),
-            ("f",     "search"),      ("Bksp",   "close panel"),
-            ("Esc",   "quit"),        ("C+scroll","zoom"),
+            ("Spc",   "play/pause"), ("Enter",  "play ch"),
+            ("n/p",   "next/prev"),  ("\\",     "nav"),
+            ("[/]",   "skip sent."), ("s",      "speed"),
+            ("v",     "voices"),     ("B",      "bookmarks"),
+            ("b",     "+bookmark"),  ("q",      "quotes"),
+            ("c",     "+quote"),     ("g",      "goto ch"),
+            ("f",     "search"),     ("a",      "align"),
+            ("t",     "theme"),      ("h",      "highlight"),
+            ("z",     "scroll"),     ("Bksp",   "close panel"),
+            ("Esc",   "quit ✓"),     ("C+scrl", "zoom"),
         ]
-        col_w   = 18
-        cols    = 2
+        col_w   = 14
+        cols    = 3
         rows_k  = (len(KEYS) + cols - 1) // cols
         box_w   = col_w * cols + 3
         box_h   = rows_k + 2
@@ -2451,7 +2455,7 @@ class TUI:
             self._sa(by+1,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+2,        rx, BOX["ml"] + BOX["h"]*(btn_w-2) + BOX["mr"], self._cp("accent"))
             self._sa(by+3,        rx, BOX["v"], self._cp("accent"))
-            self._sa(by+3,        rx+1, " q quit ".center(btn_w-2)[:btn_w-2], self._cp("err", bold=True))
+            self._sa(by+3,        rx+1, "Esc quit ✓".center(btn_w-2)[:btn_w-2], self._cp("err", bold=True))
             self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+4,        rx, BOX["bl"] + BOX["h"]*(btn_w-2) + BOX["br"], self._cp("accent"))
 
@@ -2563,6 +2567,37 @@ class TUI:
         nav_w, tl, tw, rpl, rpw, hh, fh, ch = self._layout(H, W)
         scenario = self._reading_scenario()
 
+        # ── Progress bar: scroll wheel to step chapters ───────────────────────
+        if (plain_up or plain_down) and my == self._bar_y and self._bar_x0 <= mx <= self._bar_x1 + 10:
+            step = -1 if plain_up else 1
+            target = max(0, min(len(self.chapters)-1, self.ch_idx + step))
+            if target != self.ch_idx:
+                was = self.player.state in ("playing", "paused", "loading", "generating")
+                self.player.stop()
+                self.ch_idx = target
+                self._invalidate()
+                if was:
+                    self._play()
+            return
+
+        # ── Progress bar: left-click to jump chapter ─────────────────────────
+        left_click = bool(bstate & curses.BUTTON1_PRESSED)
+        if left_click and my == self._bar_y and self._bar_x0 <= mx <= self._bar_x1 + 10:
+            total_ch = len(self.chapters)
+            if total_ch > 1:
+                # Map click position within the bar to a chapter index
+                bar_pos = mx - self._bar_x0
+                ratio   = max(0.0, min(1.0, bar_pos / max(1, self._bar_bw - 1)))
+                target  = int(round(ratio * (total_ch - 1)))
+                if target != self.ch_idx:
+                    was = self.player.state in ("playing", "paused", "loading", "generating")
+                    self.player.stop()
+                    self.ch_idx = target
+                    self._invalidate()
+                    if was:
+                        self._play()
+            return
+
         if plain_up or plain_down:
             delta = -3 if plain_up else 3
             if self.rpanel and mx >= rpl:
@@ -2607,10 +2642,12 @@ class TUI:
 
         kb = self._kb_match
 
-        # ── Quit (Esc by default; user can remap to "q" via keybinds) ─────────
+        # ── Quit (Esc by default; user can remap via keybinds) — confirm first ──
         if kb(key, "quit"):
-            self._preload.invalidate()
-            self.player.stop(); self.running = False; return
+            if self._confirm_quit():
+                self._preload.invalidate()
+                self.player.stop(); self.running = False
+            return
 
         # ── Meta ───────────────────────────────────────────────────────────────
         if kb(key, "toggle_debug"):
@@ -2886,6 +2923,24 @@ class TUI:
                 self._save_quote(); return True
 
         return False
+
+    # ── Goto chapter inline prompt ────────────────────────────────────────────
+
+    # ── Quit confirmation prompt ────────────────────────────────────────────
+
+    def _confirm_quit(self) -> bool:
+        """Show a one-line confirmation bar. Returns True if user confirms."""
+        H, W = self.scr.getmaxyx()
+        prompt = " Quit readaloud? [y] yes  [n / Esc] no "
+        self._sa(H-2, 0, " "*(W-1), self._cp("err"))
+        self._sa(H-2, max(0, (W - len(prompt)) // 2), prompt, self._cp("err", bold=True))
+        self.scr.refresh()
+        while True:
+            k = self.scr.getch()
+            if k in (ord('y'), ord('Y')):
+                return True
+            if k in (ord('n'), ord('N'), 27):
+                return False
 
     # ── Goto chapter inline prompt ────────────────────────────────────────────
 
