@@ -738,6 +738,82 @@ _KITTY_DEC   = b"\x1b]30002\x1b\\"
 _KITTY_RESET = b"\x1b]30003\x1b\\"
 
 
+# ─── Keybinds ─────────────────────────────────────────────────────────────────
+# All user-remappable actions. Values are key strings resolved by _key_code().
+# Special names: "esc", "enter", "space", "tab", "backspace",
+#                "up", "down", "left", "right", "pgup", "pgdn".
+# Single printable characters used directly, e.g. "q", "B", "?".
+# To remap, add entries to the "keybinds" dict in config.json.
+# Example: "keybinds": {"quit": "q", "panel_quotes": "Q"}
+
+DEFAULT_KEYBINDS: Dict[str, str] = {
+    # Playback
+    "play_pause":    "space",
+    "play_chapter":  "enter",
+    "next_chapter":  "n",
+    "prev_chapter":  "p",
+    "cycle_speed":   "s",
+    "skip_fwd":      "]",
+    "skip_back":     "[",
+    # Navigation
+    "toggle_nav":    "\\",
+    "goto_chapter":  "g",
+    "search":        "f",
+    "cycle_focus":   "tab",
+    # Display
+    "cycle_align":   "a",
+    "cycle_theme":   "t",
+    "toggle_hl":     "h",
+    "toggle_auto":   "z",
+    # Panels (toggle open/close)
+    "panel_voices":  "v",
+    "panel_bmarks":  "B",
+    "panel_quotes":  "q",
+    "close_panel":   "backspace",
+    # Content
+    "save_quote":    "c",
+    "add_bookmark":  "b",
+    # Meta
+    "toggle_debug":  "?",
+    "quit":          "esc",
+}
+
+
+def _key_code(s: str) -> List[int]:
+    """Resolve a keybind string to a list of matching integer key codes.
+    The handler checks: key in _key_code(binding_string).
+    Returns [] for unrecognised strings (binding effectively disabled).
+    """
+    import curses as _c
+    SPECIAL: Dict[str, List[int]] = {
+        "esc":       [27],
+        "enter":     [_c.KEY_ENTER, 10, 13],
+        "space":     [ord(" ")],
+        "tab":       [9],
+        "backspace": [_c.KEY_BACKSPACE, 127, 8],
+        "up":        [_c.KEY_UP],
+        "down":      [_c.KEY_DOWN],
+        "left":      [_c.KEY_LEFT],
+        "right":     [_c.KEY_RIGHT],
+        "pgup":      [_c.KEY_PPAGE],
+        "pgdn":      [_c.KEY_NPAGE],
+        "delete":    [_c.KEY_DC],
+        "home":      [_c.KEY_HOME],
+        "end":       [_c.KEY_END],
+    }
+    raw = s.strip()
+    canonical = raw.lower() if len(raw) > 1 else raw
+    if canonical in SPECIAL:
+        return SPECIAL[canonical]
+    if len(raw) == 1:
+        codes = [ord(raw)]
+        if raw.isalpha():
+            opp = raw.upper() if raw.islower() else raw.lower()
+            codes.append(ord(opp))
+        return codes
+    return []
+
+
 def load_config():
     if CONFIG_PATH.exists():
         try:
@@ -754,6 +830,7 @@ def load_config():
         "bookmarks": {},
         "quotes": {},
         "engine": "edge-tts",
+        "keybinds": {},
     }
 
 def save_config(cfg):
@@ -939,6 +1016,10 @@ class Player:
         self._pause_ts     = 0.0
         self._paused_total = 0.0
         self.on_done       = None
+        # Seek support: stored after synthesis so seek() can restart ffplay
+        self._playlist_path: Optional[str] = None
+        self._current_speed: float = 1.0
+        self._afchain: List[str] = []          # pre-built atempo filter chain
         # F5-TTS animation
         self._anim_idx     = 0
         self._anim_ts      = 0.0
@@ -1052,6 +1133,11 @@ class Player:
             chain.append("atempo=2.0"); tempo /= 2.0
         chain.append(f"atempo={tempo:.3f}")
 
+        # Persist so seek() can restart ffplay without re-synthesis
+        self._playlist_path = playlist
+        self._current_speed = speed
+        self._afchain       = chain
+
         self.state = "playing"
         self.play_start_ts = time.time()
         log.debug("playback start, timing_map entries=%d", len(self._timing_map))
@@ -1112,6 +1198,49 @@ class Player:
         self.est_char_pos = 0
         log.debug("player stopped")
 
+    def seek(self, target_secs: float):
+        """Restart ffplay at target_secs into the current playlist — no re-synthesis.
+        Uses the stored _playlist_path / _afchain from the most recent synthesis.
+        Falls back silently if no playlist is available.
+        """
+        if not self._playlist_path or not os.path.exists(self._playlist_path):
+            log.warning("seek: no playlist available")
+            return
+        # Kill current ffplay without triggering on_done
+        was_paused = self._pause_evt.is_set()
+        self._pause_evt.clear()
+        self._stop_evt.set()
+        if self._proc and self._proc.poll() is None:
+            try: self._proc.terminate()
+            except: pass
+        # Small wait for the poll loop to exit — don't join the thread
+        time.sleep(0.15)
+        self._stop_evt.clear()
+        if was_paused:
+            self._pause_evt.clear()
+
+        self._paused_total  = 0.0
+        self.play_start_ts  = time.time() - target_secs   # clock appears to start at target
+        # Adjust est_char_pos immediately so highlight snaps to target sentence
+        self.est_char_pos   = min(
+            _lookup_timing(self._timing_map, target_secs),
+            self.chapter_len)
+        self.state = "playing"
+        log.info("seek: restarting ffplay at %.2fs", target_secs)
+
+        try:
+            self._proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-ss", f"{target_secs:.3f}",
+                 "-f", "concat", "-safe", "0", "-i", self._playlist_path,
+                 "-af", ",".join(self._afchain)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.state = "error"
+            self.error_msg = f"seek ffplay error: {e}"
+            log.error(self.error_msg)
+
     def play_cached(self, playlist: str, audio_dir: str,
                     chapter_len: int, speed: float,
                     timing_map: Optional[List[tuple]] = None):
@@ -1136,6 +1265,10 @@ class Player:
         while tempo > 2.0:
             chain.append("atempo=2.0"); tempo /= 2.0
         chain.append(f"atempo={tempo:.3f}")
+
+        self._playlist_path = playlist
+        self._current_speed = speed
+        self._afchain       = chain
 
         self.state = "playing"
         self.play_start_ts = time.time()
@@ -1472,16 +1605,20 @@ class TUI:
         self._t_ch        = -1
         self._t_align     = None
         self._t_width     = -1
-        self._autoscroll  = True
+        self._autoscroll  = "page"   # "off" | "creep" | "page"
         self._highlight   = True
         self._debug       = start_debug
         self._last_key    = ""
         self._last_mouse  = ""
         self._bm_key      = self.filename
         self.cfg.setdefault("bookmarks", {}).setdefault(self._bm_key, [])
-        self.cfg.setdefault("quotes", {}).setdefault(self._bm_key, [])
+        self.cfg.setdefault("quotes",    {}).setdefault(self._bm_key, [])
         self.cfg.setdefault("engine", "edge-tts")
-        self._search_query = ""   # last chapter search query
+        self.cfg.setdefault("keybinds", {})
+        self._search_query = ""
+        # Resolve keybindings: merge user overrides onto defaults
+        _merged_kb = {**DEFAULT_KEYBINDS, **self.cfg.get("keybinds", {})}
+        self._kb   = {action: _key_code(ks) for action, ks in _merged_kb.items()}
         self._mgr         = get_manager()
         self._preload     = PreloadCache()
         # Multi-page snake scroll: total line offset across all columns
@@ -1563,22 +1700,25 @@ class TUI:
 
     def _skip_sentences(self, delta: int):
         """Jump forward (delta>0) or backward (delta<0) by |delta| sentences.
-        Restarts synthesis from the target sentence so audio matches position.
-        Only active while playing or paused; does nothing while loading/generating.
+        Uses seek() to restart ffplay at the target timestamp — no re-synthesis.
+        Falls back to re-synthesis only when no timing map is available.
+        Only active while playing or paused.
         """
-        if self.player.state not in ("playing", "paused", "done"):
+        if self.player.state not in ("playing", "paused"):
             return
         _, text = self.chapters[self.ch_idx]
         sentences = re.split(r'(?<=[.!?])\s+', text)
         if not sentences:
             return
+
         # Build cumulative char offsets for each sentence
-        offsets = []
+        offsets: List[int] = []
         pos = 0
         for s in sentences:
             offsets.append(pos)
             pos += len(s) + 1
-        # Find current sentence index from est_char_pos
+
+        # Find current sentence from est_char_pos
         cur_pos = self.player.est_char_pos
         cur_idx = 0
         for i, off in enumerate(offsets):
@@ -1586,19 +1726,32 @@ class TUI:
                 cur_idx = i
             else:
                 break
-        target_idx = max(0, min(len(sentences) - 1, cur_idx + delta))
-        target_text = " ".join(sentences[target_idx:])
+        target_idx  = max(0, min(len(sentences) - 1, cur_idx + delta))
         target_char = offsets[target_idx]
         log.info("skip_sentences delta=%d cur=%d target=%d char=%d",
                  delta, cur_idx, target_idx, target_char)
-        engine = self.cfg.get("engine", "edge-tts")
-        voice  = current_voice_id(self.cfg)
-        speed  = SPEEDS[self.cfg["speed_index"]]
-        self.player.stop()
-        # Seed est_char_pos so highlight lands on correct sentence immediately
-        self.player.chapter_len  = len(text)
-        self.player.est_char_pos = target_char
-        self.player.play(target_text, voice, speed, engine)
+
+        tm = self.player._timing_map
+        if tm:
+            # Reverse-lookup: find playback time for target char offset
+            # Walk the timing map forward until we pass target_char
+            target_secs = 0.0
+            for (t, c) in tm:
+                if c <= target_char:
+                    target_secs = t
+                else:
+                    break
+            self.player.seek(target_secs)
+        else:
+            # No timing map (e.g. still loading) — fall back to re-synthesis
+            engine = self.cfg.get("engine", "edge-tts")
+            voice  = current_voice_id(self.cfg)
+            speed  = SPEEDS[self.cfg["speed_index"]]
+            target_text = " ".join(sentences[target_idx:])
+            self.player.stop()
+            self.player.chapter_len  = len(text)
+            self.player.est_char_pos = target_char
+            self.player.play(target_text, voice, speed, engine)
 
     # ── Text helpers ──────────────────────────────────────────────────────────
 
@@ -1771,7 +1924,8 @@ class TUI:
               "idle":       self._cp("normal")}.get(state, self._cp("normal"))
         zi   = self.cfg.get("zoom", ZOOM_DEFAULT)
         albl = self.cfg.get("align","left").capitalize()
-        auto = "AUTO↓" if self._autoscroll else "─────"
+        auto = {"off": "─────", "creep": "CREEP↓", "page": "PAGE↓"}.get(
+            self._autoscroll, "─────")
         hl_l = "HL" if self._highlight else "hl"
         dbg  = " DBG" if self._debug else ""
         scn  = f" S{self._reading_scenario()}"
@@ -1889,13 +2043,17 @@ class TUI:
         hl = -1
         if self._highlight and self.player.state in ("playing", "paused"):
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            if self._autoscroll:
+            if self._autoscroll == "creep":
                 mg = 3
                 if hl < self.view_scroll + mg:
                     self.view_scroll = max(0, hl - mg)
                 elif hl >= self.view_scroll + vis - mg:
-                    # Page-flip: jump a full page so the highlighted line
-                    # lands near the top of the new page — no eye strain
+                    self.view_scroll = min(maxs, self.view_scroll + 1)
+            elif self._autoscroll == "page":
+                mg = 3
+                if hl < self.view_scroll + mg:
+                    self.view_scroll = max(0, hl - mg)
+                elif hl >= self.view_scroll + vis - mg:
                     self.view_scroll = min(maxs, hl - mg)
 
         for row in range(vis):
@@ -1957,7 +2115,13 @@ class TUI:
         hl = -1
         if self._highlight and self.player.state in ("playing", "paused"):
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            if self._autoscroll:
+            if self._autoscroll == "creep":
+                mg = 3
+                if hl < self._snake_scroll + mg:
+                    self._snake_scroll = max(0, hl - mg)
+                elif hl >= self._snake_scroll + total_vis - mg:
+                    self._snake_scroll = min(maxs, self._snake_scroll + 1)
+            elif self._autoscroll == "page":
                 mg = 3
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
@@ -2019,7 +2183,13 @@ class TUI:
         hl = -1
         if self._highlight and self.player.state in ("playing", "paused"):
             hl = self._char_to_line(self.player.est_char_pos, lines)
-            if self._autoscroll:
+            if self._autoscroll == "creep":
+                mg = 3
+                if hl < self._snake_scroll + mg:
+                    self._snake_scroll = max(0, hl - mg)
+                elif hl >= self._snake_scroll + total_vis - mg:
+                    self._snake_scroll = min(maxs, self._snake_scroll + 1)
+            elif self._autoscroll == "page":
                 mg = 3
                 if hl < self._snake_scroll + mg:
                     self._snake_scroll = max(0, hl - mg)
@@ -2221,15 +2391,16 @@ class TUI:
                      self._cp("playing"))
 
         KEYS = [
-            ("Spc", "play/pause"),  ("Enter", "play ch"),
-            ("n/p",  "next/prev"),  ("\\",     "nav"),
-            ("f",    "search"),     ("v",      "voices"),
-            ("B",    "bookmarks"),  ("b",      "+bookmark"),
-            ("Q",    "quotes"),     ("c",       "+quote"),
-            ("s",    "speed"),      ("a",      "align"),
-            ("t",    "theme"),      ("z",      "autoscroll"),
-            ("h",    "highlight"),  ("g",      "goto"),
-            ("C+scroll","zoom"),
+            ("Spc",   "play/pause"),  ("Enter",  "play ch"),
+            ("n/p",   "next/prev"),   ("\\",     "nav"),
+            ("[/]",   "skip sent."),  ("v",      "voices"),
+            ("B",     "bookmarks"),   ("b",      "+bookmark"),
+            ("q",     "quotes"),      ("c",      "+quote"),
+            ("s",     "speed"),       ("a",      "align"),
+            ("t",     "theme"),       ("z",      "scroll mode"),
+            ("h",     "highlight"),   ("g",      "goto"),
+            ("f",     "search"),      ("Bksp",   "close panel"),
+            ("Esc",   "quit"),        ("C+scroll","zoom"),
         ]
         col_w   = 18
         cols    = 2
@@ -2309,7 +2480,7 @@ class TUI:
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
-        # Solid background fill — paint each interior row to block text behind it
+        # Flood-fill interior with solid hdr background so nothing bleeds through
         bg_attr = self._cp("hdr")
         for r in range(dh):
             try: self.scr.addstr(dy+r, dx, " "*dw, bg_attr)
@@ -2319,7 +2490,7 @@ class TUI:
         for r in range(1, dh-1):
             self._sa(dy+r, dx,      BOX["v"], self._cp("playing", bold=True))
             self._sa(dy+r, dx+dw-1, BOX["v"], self._cp("playing", bold=True))
-        self._sa(dy, dx+2, " DEBUG  (? to close) ", self._cp("playing", bold=True))
+        self._sa(dy, dx+2, " DEBUG  (Bksp to close) ", self._cp("playing", bold=True))
 
         eng_avail = {k: v for k, v in self._mgr.availability.items()}
         engine = self.cfg.get('engine', 'edge-tts')
@@ -2419,6 +2590,10 @@ class TUI:
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
 
+    def _kb_match(self, key: int, action: str) -> bool:
+        """Return True if key matches the resolved codes for action."""
+        return key in self._kb.get(action, [])
+
     def _handle_key(self, key):
         if key == -1: return
         try:
@@ -2430,100 +2605,68 @@ class TUI:
             if self._handle_rp_key(key):
                 return
 
-        if key == ord('q'):
+        kb = self._kb_match
+
+        # ── Quit (Esc by default; user can remap to "q" via keybinds) ─────────
+        if kb(key, "quit"):
             self._preload.invalidate()
             self.player.stop(); self.running = False; return
 
-        if key == ord('Q'):
-            if self.rpanel == "quotes":
-                self.rpanel = None
-                self.focus  = "text"
-            else:
-                self.rpanel = "quotes"
-                self.rp_sel = 0
-                self.rp_scroll = 0
-                self.focus  = "rpanel"
-            self._invalidate()
-            return
-
-        if key == ord('?'):
+        # ── Meta ───────────────────────────────────────────────────────────────
+        if kb(key, "toggle_debug"):
             self._debug = not self._debug; return
 
-        if key in (ord('h'), ord('H')):
+        # ── Display ────────────────────────────────────────────────────────────
+        if kb(key, "toggle_hl"):
             self._highlight = not self._highlight; return
 
-        if key == ord(' '):
+        if kb(key, "cycle_align"):
+            cur = self.cfg.get("align","left")
+            self.cfg["align"] = ALIGN_ORDER[(ALIGN_ORDER.index(cur)+1) % len(ALIGN_ORDER)]
+            save_config(self.cfg); self._invalidate(); return
+
+        if kb(key, "cycle_theme"):
+            cur = self.cfg.get("theme","terminal")
+            idx = THEME_ORDER.index(cur) if cur in THEME_ORDER else 0
+            self.cfg["theme"] = THEME_ORDER[(idx+1) % len(THEME_ORDER)]
+            save_config(self.cfg); self._setup_colors(); return
+
+        if kb(key, "toggle_auto"):
+            cycle = {"off": "creep", "creep": "page", "page": "off"}
+            self._autoscroll = cycle.get(self._autoscroll, "page"); return
+
+        # ── Playback ───────────────────────────────────────────────────────────
+        if kb(key, "play_pause"):
             if self.player.state in ("playing","paused"):
                 self.player.toggle_pause()
             else:
                 self._play()
             return
 
-        if key in (curses.KEY_ENTER, 10, 13):
+        if kb(key, "play_chapter"):
             self.player.stop(); self._play(); return
 
-        if key == ord('\t'):
-            order = ["chapters","text"]
-            if self.rpanel: order.append("rpanel")
-            cur = self.focus if self.focus in order else "chapters"
-            self.focus = order[(order.index(cur)+1) % len(order)]
-            return
-
-        if key == ord('\\'):
-            self.nav_visible = not self.nav_visible
-            self._invalidate(); return
-
-        if key in (ord('v'), ord('V')):
-            if self.rpanel == "voices":
-                self.rpanel = None
-                self.focus  = "text"
-            else:
-                self.rpanel = "voices"
-                self._rp_section = "engine"
-                self._engine_sel = ENGINE_ORDER.index(self.cfg.get("engine","edge-tts"))
-                self._voice_sel  = self.cfg.get("voice_index", 0)
-                self.rp_scroll   = 0
-                self.focus       = "rpanel"
-            self._invalidate()
-            return
-
-        if key in (ord('B'),):
-            if self.rpanel == "bookmarks":
-                self.rpanel = None
-                self.focus  = "text"
-            else:
-                self.rpanel = "bookmarks"
-                self.rp_sel = 0
-                self.rp_scroll = 0
-                self.focus  = "rpanel"
-            self._invalidate()
-            return
-
-        if key == 27:
-            if self.rpanel:
-                self.rpanel = None
-                self.focus  = "text"
-                self._invalidate()
-            return
-
-        if key in (ord('n'), ord('N')):
+        if kb(key, "next_chapter"):
             if self.ch_idx < len(self.chapters)-1:
                 self.player.stop()
                 self.ch_idx += 1
                 self._invalidate(); self._play()
             return
 
-        if key in (ord('p'), ord('P')):
+        if kb(key, "prev_chapter"):
             if self.ch_idx > 0:
                 self.player.stop()
                 self.ch_idx -= 1
                 self._invalidate(); self._play()
             return
 
-        if key in (ord('f'), ord('F')):
-            self._search_chapters(); return
+        if kb(key, "skip_fwd"):
+            self._skip_sentences(+1); return
 
-        if key in (ord('s'), ord('S')):
+        if kb(key, "skip_back"):
+            self._skip_sentences(-1); return
+
+        if kb(key, "cycle_speed"):
             was = self.player.state in ("playing","paused","loading","generating")
             self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
             save_config(self.cfg)
@@ -2531,7 +2674,65 @@ class TUI:
             if was: self.player.stop(); self._play()
             return
 
-        if key == ord('b'):
+        # ── Navigation ─────────────────────────────────────────────────────────
+        if kb(key, "toggle_nav"):
+            self.nav_visible = not self.nav_visible
+            self._invalidate(); return
+
+        if kb(key, "cycle_focus"):
+            order = ["chapters","text"]
+            if self.rpanel: order.append("rpanel")
+            cur = self.focus if self.focus in order else "chapters"
+            self.focus = order[(order.index(cur)+1) % len(order)]
+            return
+
+        if kb(key, "goto_chapter"):
+            self._goto_chapter(); return
+
+        if kb(key, "search"):
+            self._search_chapters(); return
+
+        # ── Panels ─────────────────────────────────────────────────────────────
+        if kb(key, "panel_voices"):
+            if self.rpanel == "voices":
+                self.rpanel = None; self.focus = "text"
+            else:
+                self.rpanel = "voices"
+                self._rp_section = "engine"
+                self._engine_sel = ENGINE_ORDER.index(self.cfg.get("engine","edge-tts"))
+                self._voice_sel  = self.cfg.get("voice_index", 0)
+                self.rp_scroll   = 0
+                self.focus       = "rpanel"
+            self._invalidate(); return
+
+        if kb(key, "panel_bmarks"):
+            if self.rpanel == "bookmarks":
+                self.rpanel = None; self.focus = "text"
+            else:
+                self.rpanel = "bookmarks"
+                self.rp_sel = 0; self.rp_scroll = 0
+                self.focus  = "rpanel"
+            self._invalidate(); return
+
+        if kb(key, "panel_quotes"):
+            if self.rpanel == "quotes":
+                self.rpanel = None; self.focus = "text"
+            else:
+                self.rpanel = "quotes"
+                self.rp_sel = 0; self.rp_scroll = 0
+                self.focus  = "rpanel"
+            self._invalidate(); return
+
+        if kb(key, "close_panel"):
+            if self.rpanel:
+                self.rpanel = None; self.focus = "text"
+                self._invalidate()
+            elif self._debug:
+                self._debug = False
+            return
+
+        # ── Content ────────────────────────────────────────────────────────────
+        if kb(key, "add_bookmark"):
             bms = self.cfg["bookmarks"].setdefault(self._bm_key, [])
             if not any(bm["chapter"] == self.ch_idx for bm in bms):
                 bms.append({"chapter": self.ch_idx, "note": ""})
@@ -2539,27 +2740,8 @@ class TUI:
                 log.info("bookmark added ch=%d", self.ch_idx)
             return
 
-        if key == ord('c'):
+        if kb(key, "save_quote"):
             self._save_quote(); return
-
-        if key in (ord('a'), ord('A')):
-            cur = self.cfg.get("align","left")
-            self.cfg["align"] = ALIGN_ORDER[(ALIGN_ORDER.index(cur)+1) % len(ALIGN_ORDER)]
-            save_config(self.cfg)
-            self._invalidate(); return
-
-        if key in (ord('t'), ord('T')):
-            cur = self.cfg.get("theme","terminal")
-            idx = THEME_ORDER.index(cur) if cur in THEME_ORDER else 0
-            self.cfg["theme"] = THEME_ORDER[(idx+1) % len(THEME_ORDER)]
-            save_config(self.cfg)
-            self._setup_colors(); return
-
-        if key in (ord('z'), ord('Z')):
-            self._autoscroll = not self._autoscroll; return
-
-        if key in (ord('g'), ord('G')):
-            self._goto_chapter(); return
 
         # Arrow keys — scenario-aware scrolling
         scenario = self._reading_scenario()
@@ -2605,7 +2787,8 @@ class TUI:
 
     def _handle_rp_key(self, key) -> bool:
         """Handle key when right panel is focused. Returns True if consumed."""
-        if key == 27:
+        # Backspace closes the panel (Esc is now quit; backspace is close_panel)
+        if key in self._kb.get("close_panel", []):
             self.rpanel = None; self.focus = "text"
             self._invalidate()
             return True
@@ -2695,11 +2878,11 @@ class TUI:
                 if quotes and self.rp_sel < len(quotes):
                     quotes.pop(self.rp_sel)
                     self.rp_sel = max(0, self.rp_sel-1)
-                    self.cfg["quotes"][self._bm_key] = quotes
+                    self.cfg.setdefault("quotes", {})[self._bm_key] = quotes
                     save_config(self.cfg)
                     log.info("quote deleted idx=%d", self.rp_sel)
                 return True
-            if key == ord('c'):
+            if key in self._kb.get("save_quote", []):
                 self._save_quote(); return True
 
         return False
@@ -2732,6 +2915,7 @@ class TUI:
             except ValueError:
                 pass
 
+
     # ── Chapter search inline prompt ─────────────────────────────────────────
 
     def _search_chapters(self):
@@ -2749,16 +2933,13 @@ class TUI:
         sel = 0
         while True:
             matches = _matches(buf)
-            # Draw search bar
             self._sa(H-2, 0, " "*(W-1), self._cp("ftr"))
             self._sa(H-2, 0, prompt + buf, self._cp("ftr", bold=True))
-            # Draw results above search bar (up to 6)
             max_res = min(6, len(matches))
             for ri in range(max_res):
                 idx, title = matches[ri]
                 ry = H - 3 - (max_res - 1 - ri)
-                attr = (self._cp("sel", bold=True) if ri == sel
-                        else self._cp("normal"))
+                attr = self._cp("sel", bold=True) if ri == sel else self._cp("normal")
                 line = f"  ch{idx+1:>4}  {title}"
                 self._sa(ry, 0, " "*(W-1), attr)
                 self._sa(ry, 0, line[:W-1], attr)
@@ -2777,13 +2958,13 @@ class TUI:
                     self._play()
                     return
                 break
-            elif k == 27:
+            elif k == 27 or k in self._kb.get("close_panel", []):
                 break
             elif k == curses.KEY_UP:
                 sel = max(0, sel - 1)
             elif k == curses.KEY_DOWN:
                 sel = min(max(0, len(matches)-1), sel + 1)
-            elif k in (curses.KEY_BACKSPACE, 127):
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
                 buf = buf[:-1]; sel = 0
             elif 32 <= k < 127:
                 buf += chr(k); sel = 0
@@ -2801,12 +2982,11 @@ class TUI:
         if not lines:
             return
         hl = self._char_to_line(self.player.est_char_pos, lines)
-        # Collect the highlighted line plus adjacent non-empty lines (full sentence)
-        parts = []
-        # Walk back to start of sentence block
+        # Walk back to sentence start, then collect until blank
         i = hl
         while i > 0 and lines[i-1].strip():
             i -= 1
+        parts = []
         while i < len(lines) and lines[i].strip():
             parts.append(lines[i].strip())
             i += 1
@@ -2815,13 +2995,8 @@ class TUI:
         quote_text = " ".join(parts)
         ch_title, _ = self.chapters[self.ch_idx]
         quotes = self.cfg.setdefault("quotes", {}).setdefault(self._bm_key, [])
-        # Avoid exact duplicates
         if not any(q["text"] == quote_text for q in quotes):
-            quotes.append({
-                "text":    quote_text,
-                "chapter": self.ch_idx,
-                "title":   ch_title,
-            })
+            quotes.append({"text": quote_text, "chapter": self.ch_idx, "title": ch_title})
             save_config(self.cfg)
             log.info("quote saved ch=%d: %s…", self.ch_idx, quote_text[:40])
 
@@ -2830,40 +3005,35 @@ class TUI:
     def _draw_rp_quotes(self, left, width, top, height):
         focused = self.focus == "rpanel"
         quotes  = self.cfg.get("quotes", {}).get(self._bm_key, [])
-        label   = f" QUOTES ({len(quotes)})"
-        if focused:
-            label += " ←"
+        label   = f" QUOTES ({len(quotes)})" + (" ←" if focused else "")
         self._sa(top,   left, label,          self._cp("accent", bold=True))
-        self._sa(top,   left+width-3, "Esc",  self._cp("dim"))
+        self._sa(top,   left+width-3, "Bksp", self._cp("dim"))
         self._sa(top+1, left, BOX["h"]*width, self._cp("accent"))
 
         if not quotes:
             self._sa(top+2, left+1, "No quotes yet.",          self._cp("dim"))
-            self._sa(top+3, left+1, "Pause on a sentence and", self._cp("dim"))
-            self._sa(top+4, left+1, "press q to save it.",     self._cp("dim"))
+            self._sa(top+3, left+1, "While playing press c",   self._cp("dim"))
+            self._sa(top+4, left+1, "to capture a sentence.",  self._cp("dim"))
         else:
-            visible = height - 5
+            visible = height - 6
             if self.rp_sel < self.rp_scroll:
                 self.rp_scroll = self.rp_sel
             elif self.rp_sel >= self.rp_scroll + visible:
                 self.rp_scroll = self.rp_sel - visible + 1
-
             for row in range(visible):
                 idx = self.rp_scroll + row
                 y   = top + 2 + row
-                if idx >= len(quotes) or y >= top + height - 2:
+                if idx >= len(quotes) or y >= top + height - 3:
                     break
-                q    = quotes[idx]
-                # Show first line of quote text, truncated to panel width
-                snippet = q["text"][:width-4]
+                q       = quotes[idx]
+                snippet = q["text"][:width-6]
                 src     = f"ch{q['chapter']+1}"
                 is_sel  = (idx == self.rp_sel and focused)
                 attr    = self._cp("sel", bold=True) if is_sel else self._cp("normal")
                 self._sa(y, left, (f" {src} {snippet}").ljust(width)[:width], attr)
-
-            # Selected quote: show full text in bottom area
+            # Expanded preview of selected quote
             if quotes and self.rp_sel < len(quotes):
-                q = quotes[self.rp_sel]
+                q      = quotes[self.rp_sel]
                 wrap_w = width - 2
                 full   = q["text"]
                 wlines = []
@@ -2873,11 +3043,10 @@ class TUI:
                     wlines.append(full[:cut])
                     full = full[cut:].lstrip()
                 wlines.append(full)
-                preview_y = top + 2 + min(visible, len(quotes))
-                self._sa(preview_y, left, BOX["h"]*width, self._cp("dim"))
+                py = top + 2 + min(visible, len(quotes))
+                self._sa(py, left, BOX["h"]*width, self._cp("dim"))
                 for li, wl in enumerate(wlines[:3]):
-                    self._sa(preview_y + 1 + li, left+1,
-                             wl[:wrap_w], self._cp("playing"))
+                    self._sa(py+1+li, left+1, wl[:wrap_w], self._cp("playing"))
 
         hint = " ↑↓:nav  d=del  c=save"
         self._sa(top+height-1, left, hint[:width], self._cp("dim"))
