@@ -2396,19 +2396,19 @@ class TUI:
 
         # Key bindings: 4 columns, readable labels, symmetric layout
         KEYS = [
-            ("Space",   "play / pause"),   ("Enter",   "play chapter"),
-            ("n",       "next chapter"),   ("p",       "prev chapter"),
-            ("[  ]",    "skip sentence"),  ("s",       "cycle speed"),
-            ("\\",      "navigation"),     ("Tab",     "cycle focus"),
-            ("v",       "voices"),         ("B",       "bookmarks"),
-            ("b",       "add bookmark"),   ("q",       "quotes"),
-            ("c",       "save quote"),     ("g",       "goto chapter"),
-            ("f",       "search"),         ("a",       "text align"),
-            ("t",       "theme"),          ("h",       "highlight"),
-            ("z",       "auto-scroll"),    ("Bksp",    "close panel"),
-            ("C+scroll","zoom"),           ("Esc",     "quit"),
+            ("Space",    "play / pause"),   ("Enter",    "play chapter"),
+            ("n",        "next chapter"),   ("p",        "prev chapter"),
+            ("[ / ]",    "skip sentence"),  ("s",        "cycle speed"),
+            ("\\",       "navigation"),     ("Tab",      "cycle focus"),
+            ("v",        "voices"),         ("B",        "bookmarks"),
+            ("b",        "add bookmark"),   ("q",        "quotes"),
+            ("c",        "save quote"),     ("g",        "goto chapter"),
+            ("f",        "search"),         ("a",        "text align"),
+            ("t",        "theme"),          ("h",        "highlight"),
+            ("z",        "auto-scroll"),    ("Bksp",     "close panel"),
+            ("C+scroll", "zoom"),           ("Esc",      "quit"),
         ]
-        col_w   = 18   # wide enough for longest label
+        col_w   = 22   # [Space] = 7 chars key + 1 space + up to 14 for label
         cols    = 4
         rows_k  = (len(KEYS) + cols - 1) // cols
         box_w   = col_w * cols + cols + 1   # cols+1 for borders + inter-col gaps
