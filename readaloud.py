@@ -1949,50 +1949,59 @@ class TUI:
         lattr   = self._cp("accent", bold=True) if focused else self._cp("dim")
         bms     = self.cfg["bookmarks"].get(self._bm_key, [])
         bm_ch   = {bm["chapter"] for bm in bms}
-        self._sa(top, 0, f" CHAPTERS{f'  ♥{len(bms)}' if bms else ''}", lattr)
-
+        hdr = " CHAPTERS"
+        if bms:
+            hdr += f"   ♥ {len(bms)}"
+        self._sa(top, 0, hdr, lattr)
         visible = height - 1
         if self.ch_idx < self.ch_scroll:
             self.ch_scroll = self.ch_idx
         elif self.ch_idx >= self.ch_scroll + visible:
             self.ch_scroll = self.ch_idx - visible + 1
-
         for row in range(visible):
             idx = self.ch_scroll + row
             y   = top + 1 + row
             if idx >= len(self.chapters): break
             title, _ = self.chapters[idx]
             is_bm    = idx in bm_ch
-            maxw     = width - 5
-            disp     = title[:maxw] + "…" if len(title) > maxw else title
-            bmark    = "♥" if is_bm else " "
-
             engine = self.cfg.get("engine", "edge-tts")
             voice  = current_voice_id(self.cfg)
             speed  = SPEEDS[self.cfg["speed_index"]]
             is_warm = (idx != self.ch_idx
                        and self._preload.warm(idx, engine, voice, speed))
-
+            suffix  = " ♥" if is_bm else ""
+            # inner_w is the space available for the body text
+            inner_w = width - 1 - len(suffix)
             if idx == self.ch_idx and self.player.state in ("playing","loading","paused","generating"):
                 icon = STATE_ICONS.get(self.player.state, "▶")
                 if self.player.state == "generating":
                     icon = "◐"
-                line = f"{bmark}{icon} {disp}"
+                disp = title[:max(1, inner_w - 3)]
+                body = f"{icon} {disp}"
                 attr = self._cp("playing", bold=True)
             elif idx == self.ch_idx and focused:
-                line = f"{bmark}› {disp}".ljust(width-1)
+                disp = title[:max(1, inner_w - 2)]
+                body = f"› {disp}"
                 attr = self._cp("sel", bold=True)
             elif idx == self.ch_idx:
-                line = f"{bmark}› {disp}"
+                disp = title[:max(1, inner_w - 2)]
+                body = f"› {disp}"
                 attr = self._cp("accent", bold=True)
             elif is_warm:
-                line = f"{bmark}⚡ {disp[:width-5]}"
+                disp = title[:max(1, inner_w - 3)]
+                body = f"⚡ {disp}"
                 attr = self._cp("ok")
             else:
-                line = f"{bmark}{idx+1:>3}. {disp[:width-7]}"
-                attr = self._cp("bm") if is_bm else self._cp("normal")
-
-            self._sa(y, 0, line[:width-1], attr)
+                prefix = f"{idx+1:>3}. "
+                disp   = title[:max(1, inner_w - len(prefix))]
+                body   = f"{prefix}{disp}"
+                attr   = self._cp("bm") if is_bm else self._cp("normal")
+            # Pad body to inner_w so the selection highlight floods the full
+            # row width; suffix is drawn separately so it never clips the body.
+            padded_body = body[:inner_w].ljust(inner_w)
+            self._sa(y, 0, padded_body, attr)
+            if suffix:
+                self._sa(y, inner_w, suffix, self._cp("dim"))
 
     # ── SCENARIO 1: Single bordered reading column ────────────────────────────
     # Triggered when BOTH panels are visible (tight space sandwiched between them).
@@ -2398,7 +2407,7 @@ class TUI:
         KEYS = [
             ("Space",    "play / pause"),   ("Enter",    "play chapter"),
             ("n",        "next chapter"),   ("p",        "prev chapter"),
-            ("[ / ]",    "skip sentence"),  ("s",        "cycle speed"),
+            ("[/]",      "skip sentence"),  ("s",        "cycle speed"),
             ("\\",       "navigation"),     ("Tab",      "cycle focus"),
             ("v",        "voices"),         ("B",        "bookmarks"),
             ("b",        "add bookmark"),   ("q",        "quotes"),
@@ -2457,23 +2466,22 @@ class TUI:
             self._sa(by+1,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+2,        rx, BOX["ml"] + BOX["h"]*(btn_w-2) + BOX["mr"], self._cp("accent"))
             self._sa(by+3,        rx, BOX["v"], self._cp("accent"))
-            self._sa(by+3,        rx+1, "Esc quit ✓".center(btn_w-2)[:btn_w-2], self._cp("err", bold=True))
+            self._sa(by+3,        rx+1, "[ ESC ]".center(btn_w-2)[:btn_w-2], self._cp("err", bold=True))
             self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+4,        rx, BOX["bl"] + BOX["h"]*(btn_w-2) + BOX["br"], self._cp("accent"))
 
     # ── Floating prev/next ────────────────────────────────────────────────────
 
-    def _draw_float_btns(self, W, H, fh):
-        y = H - fh - 2
-        if y < 4: return
-        prev = " ◀ prev "
-        nxt  = " next ▶ "
-        x    = W - len(prev) - len(nxt) - 3
-        if x < 2: return
-        pa = self._cp("btn", bold=True) if self.ch_idx > 0                    else self._cp("dim")
-        na = self._cp("btn", bold=True) if self.ch_idx < len(self.chapters)-1 else self._cp("dim")
-        self._sa(y, x,               prev, pa)
-        self._sa(y, x+len(prev)+1,   nxt,  na)
+#    def _draw_float_btns(self, W, H, fh):
+#        y = H - fh - 2
+#        prev = " ◀ prev "
+#        nxt  = " next ▶ "
+#        x    = W - len(prev) - len(nxt) - 3
+#        if x < 2: return
+#        pa = self._cp("btn", bold=True) if self.ch_idx > 0                    else self._cp("dim")
+#        na = self._cp("btn", bold=True) if self.ch_idx < len(self.chapters)-1 else self._cp("dim")
+#        self._sa(y, x,               prev, pa)
+#        self._sa(y, x+len(prev)+1,   nxt,  na)
 
     # ── Debug overlay ─────────────────────────────────────────────────────────
 
@@ -2925,8 +2933,6 @@ class TUI:
                 self._save_quote(); return True
 
         return False
-
-    # ── Goto chapter inline prompt ────────────────────────────────────────────
 
     # ── Quit confirmation prompt ────────────────────────────────────────────
 
