@@ -1897,7 +1897,7 @@ class TUI:
         tn      = THEMES.get(self.cfg.get("theme","terminal"),{}).get("name","")
         engine  = self.cfg.get("engine","edge-tts")
         elabel  = ENGINE_META.get(engine,{}).get("label", engine)
-        title   = f"  📖 readaloud  ─  {self.filename}"
+        title = f"  📜 readaloud  ─  {self.filename}"
         nav_ind = "◀▶" if self.nav_visible else "▶▶"
         rp_ind  = ("V" if self.rpanel=="voices" else
                    "B" if self.rpanel=="bookmarks" else
@@ -3142,7 +3142,7 @@ def pick_file(stdscr):
         H, W = stdscr.getmaxyx()
         try:
             stdscr.addstr(0, 0, " "*(W-1), curses.color_pair(8)|curses.A_BOLD)
-            stdscr.addstr(0, 0, f"  📖 readaloud — {cwd}"[:W-1], curses.color_pair(8)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f"  📜 readaloud — {cwd}"[:W-1], ...)
             stdscr.addstr(1, 0, "─"*(W-1), curses.color_pair(2))
         except curses.error: pass
         vis = H-5
