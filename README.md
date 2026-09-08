@@ -10,15 +10,15 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 
 **Reading scenario 1 — both panels visible, single focused reading column**
 
-![Both panels open, single reading column](R1_showcase)
+![Both panels open, single reading column](260712_08h57m51s_screenshot.png)
 
 **Reading scenario 2 — one panel visible, two-column snake layout**
 
-![One panel open, two-column snake flow](R2_showcase)
+![One panel open, two-column snake flow](260712_08h57m09s_screenshot.png)
 
 **Reading scenario 3 — both panels hidden, three-column snake layout**
 
-![Both panels hidden, three-column snake flow](R3_showcase)
+![Both panels hidden, three-column snake flow](260712_08h56m06s_screenshot.png)
 
 ---
 
