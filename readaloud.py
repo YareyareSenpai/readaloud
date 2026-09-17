@@ -464,7 +464,7 @@ def parse_epub(path):
 
 def parse_txt(path):
     text   = Path(path).read_text(errors="replace")
-    chunks = re.split(r'(?m)\n{3,}|^(Chapter\s+\w+.*)', text)
+    chunks = re.split(r'\n{3,}|(?m)^(Chapter\s+\w+.*)', text)
     out, buf, n = [], [], 1
     for chunk in chunks:
         if chunk is None:
@@ -560,7 +560,7 @@ def parse_md(path):
 
 def parse_txt_string(text: str, stem: str) -> list:
     """Split a plain-text string into chapter tuples (shared helper)."""
-    chunks = re.split(r'(?m)\n{3,}|^(Chapter\s+\w+.*)', text)
+    chunks = re.split(r'\n{3,}|(?m)^(Chapter\s+\w+.*)', text)
     out, buf, n = [], [], 1
     for chunk in chunks:
         if chunk is None:
@@ -3142,7 +3142,7 @@ def pick_file(stdscr):
         H, W = stdscr.getmaxyx()
         try:
             stdscr.addstr(0, 0, " "*(W-1), curses.color_pair(8)|curses.A_BOLD)
-            stdscr.addstr(0, 0, f"  📜 readaloud — {cwd}"[:W-1], ...)
+            stdscr.addstr(0, 0, f"  📜 readaloud — {cwd}"[:W-1], curses.color_pair(8)|curses.A_BOLD)
             stdscr.addstr(1, 0, "─"*(W-1), curses.color_pair(2))
         except curses.error: pass
         vis = H-5
