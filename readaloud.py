@@ -2470,18 +2470,10 @@ class TUI:
             self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+4,        rx, BOX["bl"] + BOX["h"]*(btn_w-2) + BOX["br"], self._cp("accent"))
 
-    # ── Floating prev/next ────────────────────────────────────────────────────
+    # ── Floating prev/next (stub — kept for future use) ──────────────────────
 
-#    def _draw_float_btns(self, W, H, fh):
-#        y = H - fh - 2
-#        prev = " ◀ prev "
-#        nxt  = " next ▶ "
-#        x    = W - len(prev) - len(nxt) - 3
-#        if x < 2: return
-#        pa = self._cp("btn", bold=True) if self.ch_idx > 0                    else self._cp("dim")
-#        na = self._cp("btn", bold=True) if self.ch_idx < len(self.chapters)-1 else self._cp("dim")
-#        self._sa(y, x,               prev, pa)
-#        self._sa(y, x+len(prev)+1,   nxt,  na)
+    def _draw_float_btns(self, W, H, fh):
+        pass
 
     # ── Debug overlay ─────────────────────────────────────────────────────────
 
@@ -2489,8 +2481,9 @@ class TUI:
         p      = self.player
         bms    = self.cfg["bookmarks"].get(self._bm_key, [])
         H2, W2 = self.scr.getmaxyx()
+        _, _, _, _, _, _, fh, _ = self._layout(H2, W2)
         dh     = 17
-        dy     = max(3, H2 - dh - 4)
+        dy     = max(3, H2 - fh - dh)
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
