@@ -52,11 +52,69 @@ class EdgeTTSBackend(BaseTTSBackend):
     """Microsoft Edge neural TTS — uses edge_tts Python API for WordBoundary timing.
     Falls back to CLI subprocess if the import is unavailable.
     generate_chunk_with_timing() returns (success, [(audio_secs, char_offset), ...]).
+
+    Failure handling:
+      * last_error holds a short human-readable reason (never the raw URL).
+      * Transient errors (e.g. NoAudioReceived) are retried once.
+      * Hard failures (HTTP 401/403/429/503 or a connection-level error) pause
+        the backend for COOLDOWN_SECS so preload workers and chapter changes
+        fail fast instead of hammering a service that is refusing us.  The
+        player uses this to fall back to an offline engine.
     """
+
+    COOLDOWN_SECS = 120
+    MAX_ATTEMPTS  = 2
+    HARD_STATUSES = (401, 403, 429, 503)
+
+    def __init__(self):
+        self.last_error       = ""
+        self._cooldown_until  = 0.0
+        self._cooldown_reason = ""
+
+    def in_cooldown(self) -> bool:
+        return time.time() < self._cooldown_until
+
+    def cooldown_remaining(self) -> int:
+        return max(0, int(self._cooldown_until - time.time() + 0.999))
+
+    def _trip(self, reason: str):
+        self._cooldown_until  = time.time() + self.COOLDOWN_SECS
+        self._cooldown_reason = reason
+        log.warning("EdgeTTS paused for %ds: %s", self.COOLDOWN_SECS, reason)
+
+    @staticmethod
+    def _describe(exc: Exception) -> str:
+        status = getattr(exc, "status", None)
+        if status in (401, 403):
+            return f"HTTP {status} — refused by Microsoft (IP blocked? try a VPN)"
+        if status == 429:
+            return "HTTP 429 — rate limited by Microsoft"
+        if status:
+            return f"HTTP {status} from Microsoft"
+        return f"{type(exc).__name__}: {exc}"
 
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
         ok, _ = self.generate_chunk_with_timing(text, voice, speed, output_path)
         return ok
+
+    def _generate_via_cli(self, text: str, voice: str, output_path: str) -> tuple:
+        """CLI fallback — no word events; _build_timing_map used by caller."""
+        try:
+            subprocess.run(
+                ["pipx", "run", "edge-tts",
+                 "--voice", voice, "--text", text, "--write-media", output_path],
+                check=True, capture_output=True, timeout=60)
+            return True, []
+        except Exception as e:
+            tail = ""
+            err = getattr(e, "stderr", None)
+            if err:
+                lines = err.decode("utf-8", errors="replace").strip().splitlines()
+                if lines:
+                    tail = f" — {lines[-1]}"
+            self.last_error = f"CLI: {type(e).__name__}{tail}"[:160]
+            log.error("EdgeTTS CLI error: %s", e)
+            return False, []
 
     def generate_chunk_with_timing(self, text: str, voice: str, speed: float,
                                     output_path: str) -> tuple:
@@ -70,59 +128,68 @@ class EdgeTTSBackend(BaseTTSBackend):
 
         Falls back to CLI (no timing data → duration-map fallback) if import fails.
         """
-        # ── Library path: true word-level timing ─────────────────────────────
+        self.last_error = ""
+
+        # Edge is paused after a recent hard failure — fail fast, no request.
+        if self.in_cooldown():
+            self.last_error = (f"paused {self.cooldown_remaining()}s after: "
+                               f"{self._cooldown_reason}")
+            return False, []
+
         try:
-            import edge_tts
             import asyncio
-
-            timing_map: List[tuple] = []
-
-            async def _stream():
-                communicate = edge_tts.Communicate(text, voice)
-                audio_bytes = bytearray()
-                search_pos = 0   # scan cursor in `text`
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_bytes.extend(chunk["data"])
-                    elif chunk["type"] == "WordBoundary":
-                        audio_secs = chunk["offset"] / 10_000_000.0
-                        word = chunk.get("text", "")
-                        if word:
-                            # Find this word's position in text, scanning forward
-                            # from where we last matched to stay in sequence.
-                            idx = text.find(word, search_pos)
-                            if idx == -1:
-                                # Case-insensitive fallback
-                                idx = text.lower().find(word.lower(), search_pos)
-                            if idx != -1:
-                                timing_map.append((audio_secs, idx))
-                                search_pos = idx + len(word)
-                            else:
-                                # Word not found (punctuation artefact) — use last pos
-                                timing_map.append((audio_secs, search_pos))
-                with open(output_path, "wb") as f:
-                    f.write(audio_bytes)
-
-            asyncio.run(_stream())
-            log.debug("EdgeTTS WB: %d word events, %d chars", len(timing_map), len(text))
-            return True, timing_map
-
+            import edge_tts
         except ImportError:
             log.debug("edge_tts library not available, falling back to CLI")
-        except Exception as e:
-            log.error("EdgeTTS stream error: %s", e)
-            return False, []
+            return self._generate_via_cli(text, voice, output_path)
 
-        # ── CLI fallback — no word events; _build_timing_map used by caller ──
-        try:
-            subprocess.run(
-                ["pipx", "run", "edge-tts",
-                 "--voice", voice, "--text", text, "--write-media", output_path],
-                check=True, capture_output=True, timeout=60)
-            return True, []
-        except Exception as e:
-            log.error("EdgeTTS CLI error: %s", e)
-            return False, []
+        # ── Library path: true word-level timing ─────────────────────────────
+        timing_map: List[tuple] = []
+
+        async def _stream():
+            communicate = edge_tts.Communicate(text, voice)
+            audio_bytes = bytearray()
+            search_pos = 0   # scan cursor in `text`
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_bytes.extend(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    audio_secs = chunk["offset"] / 10_000_000.0
+                    word = chunk.get("text", "")
+                    if word:
+                        # Find this word's position in text, scanning forward
+                        # from where we last matched to stay in sequence.
+                        idx = text.find(word, search_pos)
+                        if idx == -1:
+                            # Case-insensitive fallback
+                            idx = text.lower().find(word.lower(), search_pos)
+                        if idx != -1:
+                            timing_map.append((audio_secs, idx))
+                            search_pos = idx + len(word)
+                        else:
+                            # Word not found (punctuation artefact) — use last pos
+                            timing_map.append((audio_secs, search_pos))
+            with open(output_path, "wb") as f:
+                f.write(audio_bytes)
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            timing_map.clear()
+            try:
+                asyncio.run(_stream())
+                log.debug("EdgeTTS WB: %d word events, %d chars", len(timing_map), len(text))
+                return True, list(timing_map)
+            except Exception as e:
+                self.last_error = self._describe(e)[:160]
+                log.error("EdgeTTS stream error (attempt %d/%d): %s",
+                          attempt, self.MAX_ATTEMPTS, self.last_error)
+                log.debug("EdgeTTS raw exception: %r", e)
+                status = getattr(e, "status", None)
+                if status in self.HARD_STATUSES or isinstance(e, OSError):
+                    self._trip(self.last_error)
+                    return False, []
+                if attempt < self.MAX_ATTEMPTS:
+                    time.sleep(1.0)
+        return False, []
 
 
 class KokoroBackend(BaseTTSBackend):
@@ -365,6 +432,26 @@ class MasterPlaybackManager:
 
     def output_ext(self, engine: str) -> str:
         return ENGINE_META.get(engine, {}).get("ext", ".mp3")
+
+    def fallback_for(self, engine: str) -> Optional[tuple]:
+        """Return (engine, voice_id) of an offline engine to use when `engine`
+        fails, or None.  Only edge-tts falls back (offline engines have nowhere
+        further to go).  Kokoro is preferred, then Piper if a model is present;
+        F5-TTS is never a fallback (too slow on CPU)."""
+        if engine != "edge-tts":
+            return None
+        for cand in ("kokoro", "piper"):
+            if not self.is_available(cand):
+                continue
+            voices = get_voices_for_engine(cand)
+            if voices and voices[0][3]:
+                return cand, voices[0][3]
+        return None
+
+    def edge_pause_remaining(self) -> int:
+        """Seconds left on the Edge TTS failure pause (0 = not paused)."""
+        be = self._backends.get("edge-tts")
+        return be.cooldown_remaining() if be else 0
 
     def synthesize(self, engine: str, text: str, voice: str,
                    speed: float, dest_path: str) -> bool:
@@ -1000,6 +1087,7 @@ class Player:
         self.chunk_idx     = 0
         self.total_chunks  = 0
         self.error_msg     = ""
+        self.notice        = ""      # transient info line (e.g. engine fallback)
         self.est_char_pos  = 0
         self.play_start_ts = 0.0
         self.chapter_len   = 0
@@ -1032,6 +1120,7 @@ class Player:
 
     def play(self, text: str, voice: str, speed: float, engine: str):
         self.stop()
+        self.notice = ""
         self._stop_evt.clear()
         self._pause_evt.clear()
         self._paused_total = 0.0
@@ -1091,11 +1180,22 @@ class Player:
                 ok = mgr.synthesize(engine, chunk, voice, speed, outfile)
 
             if not ok:
-                self.state = "error"
                 backend = mgr._backends.get(engine)
                 detail = getattr(backend, "last_error", "") or f"synthesis failed on chunk {i+1}"
+                log.error("%s: %s", engine, detail)
+                fb = None if self._stop_evt.is_set() else mgr.fallback_for(engine)
+                if fb:
+                    # Restart the whole chapter on the offline engine — mixing
+                    # mp3 and wav chunks in one concat playlist is not safe.
+                    fb_engine, fb_voice = fb
+                    self.notice = (f"{ENGINE_META[engine]['label']}: {detail}"
+                                   f" — using {ENGINE_META[fb_engine]['label']}")
+                    log.warning("falling back %s -> %s (%s)", engine, fb_engine, fb_voice)
+                    self._cleanup(tmpdir)
+                    self._run(text, fb_voice, speed, fb_engine)
+                    return
+                self.state = "error"
                 self.error_msg = f"{engine}: {detail}"
-                log.error(self.error_msg)
                 self._cleanup(tmpdir); return
             if not os.path.exists(outfile):
                 self.state = "error"
@@ -1244,6 +1344,7 @@ class Player:
         timing_map, if provided, is used for accurate position tracking.
         """
         self.stop()
+        self.notice = ""
         self._stop_evt.clear()
         self._pause_evt.clear()
         self._paused_total = 0.0
@@ -1679,11 +1780,29 @@ class TUI:
                     self.player.state = "idle"
         threading.Thread(target=_deferred, daemon=True).start()
 
-    def _play(self):
+    def _resolve_engine(self):
+        """(engine, voice) actually used for synthesis right now.
+        Normally the configured pair; while Edge TTS is paused after a hard
+        failure (403 / network) this is the offline fallback, so cache keys,
+        preloading and the header all agree with what is really playing."""
         engine = self.cfg.get("engine", "edge-tts")
         voice  = current_voice_id(self.cfg)
+        if engine == "edge-tts" and self._mgr.edge_pause_remaining() > 0:
+            fb = self._mgr.fallback_for(engine)
+            if fb:
+                return fb
+        return engine, voice
+
+    def _play(self):
+        cfg_engine = self.cfg.get("engine", "edge-tts")
+        engine, voice = self._resolve_engine()
         speed  = SPEEDS[self.cfg["speed_index"]]
         _, text = self.chapters[self.ch_idx]
+        note = ""
+        if engine != cfg_engine:
+            note = (f"{ENGINE_META[cfg_engine]['label']} paused "
+                    f"{self._mgr.edge_pause_remaining()}s after a failure — "
+                    f"using {ENGINE_META[engine]['label']}")
         log.info("play ch=%d engine=%s voice=%s speed=%s", self.ch_idx, engine, voice, speed)
 
         cached = self._preload.get_playlist(self.ch_idx, engine, voice, speed)
@@ -1695,6 +1814,9 @@ class TUI:
         else:
             log.info("preload: cache MISS ch=%d — synthesizing live", self.ch_idx)
             self.player.play(text, voice, speed, engine)
+
+        if note:
+            self.player.notice = note
 
         # Prime the next PRELOAD_AHEAD chapters in background
         self._preload.prime(self.chapters, self.ch_idx, engine, voice, speed)
@@ -1745,8 +1867,7 @@ class TUI:
             self.player.seek(target_secs)
         else:
             # No timing map (e.g. still loading) — fall back to re-synthesis
-            engine = self.cfg.get("engine", "edge-tts")
-            voice  = current_voice_id(self.cfg)
+            engine, voice = self._resolve_engine()
             speed  = SPEEDS[self.cfg["speed_index"]]
             target_text = " ".join(sentences[target_idx:])
             self.player.stop()
@@ -1895,8 +2016,10 @@ class TUI:
         except curses.error: pass
 
         tn      = THEMES.get(self.cfg.get("theme","terminal"),{}).get("name","")
-        engine  = self.cfg.get("engine","edge-tts")
+        engine, _eff_voice = self._resolve_engine()
         elabel  = ENGINE_META.get(engine,{}).get("label", engine)
+        if engine != self.cfg.get("engine","edge-tts"):
+            elabel += "*"     # fallback engine active
         title = f"  📜 readaloud  ─  {self.filename}"
         nav_ind = "◀▶" if self.nav_visible else "▶▶"
         rp_ind  = ("V" if self.rpanel=="voices" else
@@ -1907,7 +2030,7 @@ class TUI:
         self._sa(0, max(len(title)+2, W-len(right)-1), right, self._cp("hdr", bold=True))
         self._sa(1, 0, BOX["h"]*(W-1), self._cp("accent"))
 
-        vname  = current_voice_id(self.cfg) or "—"
+        vname  = _eff_voice or "—"
         speed  = SPEEDS[self.cfg["speed_index"]]
         state  = self.player.state
         # F5 animation
@@ -1964,8 +2087,7 @@ class TUI:
             if idx >= len(self.chapters): break
             title, _ = self.chapters[idx]
             is_bm    = idx in bm_ch
-            engine = self.cfg.get("engine", "edge-tts")
-            voice  = current_voice_id(self.cfg)
+            engine, voice = self._resolve_engine()
             speed  = SPEEDS[self.cfg["speed_index"]]
             is_warm = (idx != self.ch_idx
                        and self._preload.warm(idx, engine, voice, speed))
@@ -2378,31 +2500,6 @@ class TUI:
         y = H - fh
         self._sa(y, 0, BOX["h"]*(W-1), self._cp("accent"))
 
-        if self.player.state == "error" and self.player.error_msg:
-            self._sa(y+1, 2, f"✗ {self.player.error_msg}"[:W//2],
-                     self._cp("err", bold=True))
-        elif self.player.state in ("loading", "generating"):
-            total  = max(1, self.player.total_chunks)
-            done   = self.player.chunk_idx
-            bw     = min(28, W//3)
-            filled = int(done/total*bw)
-            bar    = "█"*filled + "░"*(bw-filled)
-            lbl    = self.player.anim_frame if self.player.state == "generating" else "◌"
-            self._sa(y+1, 2, f"{lbl} [{bar}] {done}/{total}",
-                     self._cp("dim", bold=True))
-        else:
-            total_ch = len(self.chapters)
-            bw     = min(28, max(16, W // 6))
-            filled = int(self.ch_idx/max(1,total_ch-1)*bw)
-            bar    = "█"*filled + "░"*(bw-filled)
-            bar_label = f"Book [{bar}] {self.ch_idx+1}/{total_ch}"
-            self._sa(y+1, 2, bar_label, self._cp("playing"))
-            # Store bar geometry for mouse hit-testing (x range of the bar itself)
-            self._bar_y    = y + 1
-            self._bar_x0   = 6          # after "Book ["
-            self._bar_x1   = 6 + bw     # end of bar
-            self._bar_bw   = bw
-
         # Key bindings: 4 columns, readable labels, symmetric layout
         KEYS = [
             ("Space",    "play / pause"),   ("Enter",    "play chapter"),
@@ -2433,6 +2530,45 @@ class TUI:
 
         if bx + box_w >= W - 14:
             bx = max(2, W - box_w - 15)
+
+        # Width available to the left of the key box for status / error text
+        left_w = max(12, bx - 4)
+
+        if self.player.state == "error" and self.player.error_msg:
+            msg = f"✗ {self.player.error_msg}"
+            for li in range(3):
+                seg = msg[li*left_w:(li+1)*left_w]
+                if seg:
+                    self._sa(y+1+li, 2, seg, self._cp("err", bold=True))
+        elif self.player.state in ("loading", "generating"):
+            total  = max(1, self.player.total_chunks)
+            done   = self.player.chunk_idx
+            bw     = min(28, W//3)
+            filled = int(done/total*bw)
+            bar    = "█"*filled + "░"*(bw-filled)
+            lbl    = self.player.anim_frame if self.player.state == "generating" else "◌"
+            self._sa(y+1, 2, f"{lbl} [{bar}] {done}/{total}",
+                     self._cp("dim", bold=True))
+        else:
+            total_ch = len(self.chapters)
+            bw     = min(28, max(16, W // 6))
+            filled = int(self.ch_idx/max(1,total_ch-1)*bw)
+            bar    = "█"*filled + "░"*(bw-filled)
+            bar_label = f"Book [{bar}] {self.ch_idx+1}/{total_ch}"
+            self._sa(y+1, 2, bar_label, self._cp("playing"))
+            # Store bar geometry for mouse hit-testing (x range of the bar itself)
+            self._bar_y    = y + 1
+            self._bar_x0   = 6          # after "Book ["
+            self._bar_x1   = 6 + bw     # end of bar
+            self._bar_bw   = bw
+
+        notice = self.player.notice
+        if notice and self.player.state in ("loading", "generating", "playing", "paused"):
+            nmsg = f"⚠ {notice}"
+            for li in range(2):
+                seg = nmsg[li*left_w:(li+1)*left_w]
+                if seg:
+                    self._sa(y+3+li, 2, seg, self._cp("playing", bold=True))
 
         ac = self._cp("accent")
         di = self._cp("dim")
@@ -2470,10 +2606,18 @@ class TUI:
             self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+4,        rx, BOX["bl"] + BOX["h"]*(btn_w-2) + BOX["br"], self._cp("accent"))
 
-    # ── Floating prev/next (stub — kept for future use) ──────────────────────
+    # ── Floating prev/next ────────────────────────────────────────────────────
 
-    def _draw_float_btns(self, W, H, fh):
-        pass
+#    def _draw_float_btns(self, W, H, fh):
+#        y = H - fh - 2
+#        prev = " ◀ prev "
+#        nxt  = " next ▶ "
+#        x    = W - len(prev) - len(nxt) - 3
+#        if x < 2: return
+#        pa = self._cp("btn", bold=True) if self.ch_idx > 0                    else self._cp("dim")
+#        na = self._cp("btn", bold=True) if self.ch_idx < len(self.chapters)-1 else self._cp("dim")
+#        self._sa(y, x,               prev, pa)
+#        self._sa(y, x+len(prev)+1,   nxt,  na)
 
     # ── Debug overlay ─────────────────────────────────────────────────────────
 
@@ -2481,9 +2625,8 @@ class TUI:
         p      = self.player
         bms    = self.cfg["bookmarks"].get(self._bm_key, [])
         H2, W2 = self.scr.getmaxyx()
-        _, _, _, _, _, _, fh, _ = self._layout(H2, W2)
         dh     = 17
-        dy     = max(3, H2 - fh - dh)
+        dy     = max(3, H2 - dh - 4)
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
 
@@ -2500,8 +2643,9 @@ class TUI:
         self._sa(dy, dx+2, " DEBUG  (Bksp to close) ", self._cp("playing", bold=True))
 
         eng_avail = {k: v for k, v in self._mgr.availability.items()}
-        engine = self.cfg.get('engine', 'edge-tts')
-        voice  = current_voice_id(self.cfg)
+        cfg_engine = self.cfg.get('engine', 'edge-tts')
+        engine, voice = self._resolve_engine()
+        pause  = self._mgr.edge_pause_remaining()
         speed  = SPEEDS[self.cfg['speed_index']]
         pl_status = "  ".join(
             f"ch{self.ch_idx+1+i}:{self._preload.status(self.ch_idx+i, engine, voice, speed)}"
@@ -2515,7 +2659,7 @@ class TUI:
             f"  Player     : state={p.state}  chunk={p.chunk_idx}/{p.total_chunks}",
             f"  Playback   : est_pos={p.est_char_pos}  ch_len={p.chapter_len}  cps={p._chars_per_sec:.1f}",
             f"  Paused     : total_paused={p._paused_total:.1f}s",
-            f"  Engine     : {engine}  voice={voice}",
+            f"  Engine     : {cfg_engine} → {engine}/{voice}  edge_pause={pause}s",
             f"  Availability: {eng_avail}",
             f"  Preload    : {pl_status or 'n/a'}",
             f"  Config     : speed={speed}×  "
