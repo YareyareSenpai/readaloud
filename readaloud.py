@@ -13,7 +13,7 @@ Reading Scenarios (auto-selected by panel visibility):
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
-import curses, traceback, logging
+import curses, traceback, logging, importlib.util
 from pathlib import Path
 from html.parser import HTMLParser
 from typing import Dict, List, Any, Optional
@@ -293,38 +293,90 @@ class PiperBackend(BaseTTSBackend):
             return False
 
 
+# F5-TTS loads its reference clip with torchaudio.load(), which on current
+# torchaudio goes through torchcodec and needs shared FFmpeg libs v4-8.
+# Systems on FFmpeg 9+ (e.g. rolling Arch) can't satisfy that, so we run the
+# F5 CLI through this shim, which swaps in a soundfile-based loader.
+F5_SHIM = (
+    "import sys, soundfile as sf, torch, torchaudio\n"
+    "def _load(uri, *a, **k):\n"
+    "    data, sr = sf.read(uri, dtype='float32', always_2d=True)\n"
+    "    return torch.from_numpy(data.T.copy()), sr\n"
+    "torchaudio.load = _load\n"
+    "sys.argv[0] = 'f5-tts_infer-cli'\n"
+    "from f5_tts.infer.infer_cli import main\n"
+    "main()\n"
+)
+
+
 class F5TTSBackend(BaseTTSBackend):
     """F5-TTS flow-matching voice cloner (slow on CPU, GPU recommended).
-    Requires: ~/.config/readaloud/voices/ref.wav (+ optional ref.txt)
+    The `voice` argument is the stem of a reference clip in
+    ~/.config/readaloud/voices/ — e.g. "ref" → ref.wav (+ optional ref.txt),
+    "ref_ryan" → ref_ryan.wav (+ optional ref_ryan.txt).
+    last_error carries the tail of the CLI's stderr so the footer and
+    debug.log show the real reason a synthesis failed.
     """
+    def __init__(self):
+        self.last_error = ""
+
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
-        ref_audio = VOICES_DIR / "ref.wav"
-        ref_text_file = VOICES_DIR / "ref.txt"
+        self.last_error = ""
+        stem = voice or "ref"
+        ref_audio = VOICES_DIR / f"{stem}.wav"
+        ref_text_file = VOICES_DIR / f"{stem}.txt"
         if not ref_audio.exists():
-            log.error("F5-TTS: ref.wav not found at %s", ref_audio)
+            self.last_error = f"reference clip not found: {ref_audio.name}"
+            log.error("F5-TTS: reference clip not found at %s", ref_audio)
+            return False
+        use_shim = importlib.util.find_spec("f5_tts") is not None
+        if not use_shim and not shutil.which("f5-tts_infer-cli"):
+            self.last_error = "f5-tts_infer-cli not on PATH (is ~/.local/bin in PATH?)"
+            log.error("F5-TTS: %s", self.last_error)
             return False
         ref_text = ""
         if ref_text_file.exists():
             ref_text = ref_text_file.read_text().strip()
-        out_dir = Path(output_path).parent
+        out_path = Path(output_path)
+        out_dir  = out_path.parent
+        base = [sys.executable, "-c", F5_SHIM] if use_shim else ["f5-tts_infer-cli"]
+        cmd = base + [
+               "--ref_audio",   str(ref_audio),
+               "--ref_text",    ref_text or "Reference voice sample.",
+               "--gen_text",    text,
+               "--output_dir",  str(out_dir),
+               "--output_file", out_path.name]
         try:
-            subprocess.run(
-                ["f5-tts_infer-cli",
-                 "--ref_audio",  str(ref_audio),
-                 "--ref_text",   ref_text or "Reference voice sample.",
-                 "--gen_text",   text,
-                 "--output_dir", str(out_dir)],
-                check=True, capture_output=True, timeout=600)
-            # CLI writes out.wav — rename to expected path
-            default_out = out_dir / "out.wav"
-            if default_out.exists():
-                default_out.rename(output_path)
-                return True
-            log.error("F5-TTS: out.wav not produced")
+            r = subprocess.run(cmd, capture_output=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            self.last_error = "timed out after 600s (CPU too slow? try a shorter chunk or GPU)"
+            log.error("F5-TTS: %s", self.last_error)
             return False
         except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"[:160]
             log.error("F5-TTS error: %s", e)
             return False
+
+        stderr = r.stderr.decode("utf-8", errors="replace").strip()
+        stdout = r.stdout.decode("utf-8", errors="replace").strip()
+        if stderr:
+            log.debug("F5-TTS stderr (tail):\n%s", "\n".join(stderr.splitlines()[-25:]))
+        if r.returncode != 0:
+            lines = [l for l in (stderr or stdout).splitlines() if l.strip()]
+            tail  = lines[-1] if lines else "no output"
+            self.last_error = f"exit {r.returncode}: {tail}"[:160]
+            log.error("F5-TTS failed: %s", self.last_error)
+            return False
+        if out_path.exists():
+            return True
+        # Older CLI builds ignore --output_file and write out.wav
+        legacy_out = out_dir / "out.wav"
+        if legacy_out.exists():
+            legacy_out.rename(output_path)
+            return True
+        self.last_error = f"CLI exited 0 but wrote no {out_path.name}"
+        log.error("F5-TTS: %s (stdout tail: %s)", self.last_error, stdout[-200:])
+        return False
 
 
 # ─── System scanner ───────────────────────────────────────────────────────────
@@ -351,7 +403,7 @@ ENGINE_META: Dict[str, Dict[str, str]] = {
     "f5-tts": {
         "label": "F5-TTS",
         "type":  "offline",
-        "note":  "Voice cloner — slow on CPU, needs ref.wav",
+        "note":  "Voice cloner — slow on CPU, needs a .wav in ~/.config/readaloud/voices/",
         "ext":   ".wav",
     },
 }
@@ -941,14 +993,27 @@ def _piper_voices() -> list:
         pass
     return voices
 
+def _f5_voices() -> list:
+    """Scan VOICES_DIR for reference clips (*.wav) and return as voice tuples.
+    The voice id is the file stem; a leading "ref_" is dropped from the label
+    so ref_ryan.wav shows as "ryan" (plain ref.wav shows as "ref")."""
+    voices = []
+    try:
+        for f in sorted(VOICES_DIR.glob("*.wav")):
+            stem  = f.stem
+            label = stem[4:] if stem.startswith("ref_") and len(stem) > 4 else stem
+            voices.append((label, "", "", stem))
+    except Exception:
+        pass
+    return voices
+
 def get_voices_for_engine(engine: str) -> list:
     if engine == "piper":
         v = _piper_voices()
         return v if v else [("(no models)", "", "", "")]
     if engine == "f5-tts":
-        ref = VOICES_DIR / "ref.wav"
-        label = "ref.wav ✓" if ref.exists() else "ref.wav missing"
-        return [(label, "", "", "ref")]
+        v = _f5_voices()
+        return v if v else [("(no ref .wav)", "", "", "")]
     return ENGINE_VOICES.get(engine, [])
 
 def current_voice_id(cfg: dict) -> str:
