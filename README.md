@@ -25,6 +25,7 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 ## Features
 
 - **Multi-backend TTS** — online (Edge TTS) and offline (Kokoro, Piper, F5-TTS) engines; auto-detected at startup
+- **Automatic Edge fallback** — if Edge TTS is refused (HTTP 401/403/429) or unreachable, readaloud pauses it for about two minutes, switches to Kokoro (or Piper if a model is present), and shows the real reason in the footer; the header marks the fallback engine with `*` (e.g. `[Kokoro*]`)
 - **12 Edge TTS voices** — US/GB/AU/CA English via Microsoft's neural API; 7 Kokoro voices included; Piper uses your own ONNX models; F5-TTS clones any voice from a reference WAV
 - **Wide format support** — EPUB, TXT, PDF, DOCX, HTML, RTF, and Markdown; chapters parsed from structure (headings, spine, page groups) or split by content length
 - **Adaptive reading layout** — 3 scenarios auto-selected by panel visibility: single focused column (both panels open), two-column snake (one panel), three-column snake (both panels hidden)
@@ -406,6 +407,17 @@ Debug logs: `~/.config/readaloud/debug.log`
 ---
 
 ## Troubleshooting
+
+**Edge TTS: `HTTP 403 — refused by Microsoft`**
+
+Microsoft rejects the WebSocket handshake for your IP. It is not a readaloud bug, not an outdated `edge-tts`, and not clock skew. Confirm by running the library directly:
+```bash
+~/.local/share/readaloud/venv/bin/edge-tts --voice en-US-AriaNeural --text "test" --write-media /tmp/t.mp3
+```
+If that also returns 403, the block is on your IP or ISP range (shared/CGNAT addresses are a common cause). Options:
+- Use a VPN — Edge TTS works as soon as the exit IP changes.
+- Use an offline engine (Kokoro is the best): press `v`, pick it, `Enter`. readaloud falls back to it automatically while Edge is paused.
+- After changing network or VPN, Edge is retried automatically once the ~2 minute pause expires.
 
 **SSL error from edge-tts**
 ```bash
