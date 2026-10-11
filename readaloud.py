@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 readaloud — EPUB/TXT reader with multi-backend neural TTS
-Backends: edge-tts (online), kokoro, piper, f5-tts (offline)
-Deps: ebooklib (pip), edge-tts (pipx), ffplay (ffmpeg)
+Backends: edge-tts, azure (online), kokoro, piper, f5-tts (offline)
+Deps: ebooklib + edge-tts (pip, in the venv), ffplay (ffmpeg); Azure needs only a key
 Usage: readaloud [file]   or just `readaloud` for file picker
        readaloud --debug  to start with debug overlay on
 
@@ -13,21 +13,24 @@ Reading Scenarios (auto-selected by panel visibility):
 """
 
 import os, sys, re, json, shutil, subprocess, tempfile, threading, time, signal
-import curses, traceback, logging, importlib.util
+import curses, logging, importlib.util, urllib.request, urllib.error
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from html.parser import HTMLParser
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 # ─── Logging (debug file, never pollutes curses) ──────────────────────────────
 
 LOG_PATH = Path.home() / ".config" / "readaloud" / "debug.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(LOG_PATH),
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Rotating so a long listening session can't grow debug.log without bound
+# (1 MB, one backup: debug.log.1).
+_log_handler = RotatingFileHandler(str(LOG_PATH), maxBytes=1_000_000,
+                                   backupCount=1, encoding="utf-8")
+_log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"))
+logging.basicConfig(level=logging.DEBUG, handlers=[_log_handler])
 log = logging.getLogger("readaloud")
 
 # ─── Config paths ─────────────────────────────────────────────────────────────
@@ -46,6 +49,29 @@ class BaseTTSBackend:
     """Shared interface all TTS engines implement."""
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
         raise NotImplementedError
+
+
+class _CooldownMixin:
+    """Failure pause shared by the online backends (Edge TTS, Azure TTS).
+    After a hard failure (auth / quota / rate limit / network) the backend is
+    paused for COOLDOWN_SECS so preload workers and chapter changes fail fast
+    instead of hammering a service that is refusing us; the player uses the
+    pause to fall back to an offline engine."""
+    COOLDOWN_SECS    = 120
+    LABEL            = "TTS"
+    _cooldown_until  = 0.0
+    _cooldown_reason = ""
+
+    def in_cooldown(self) -> bool:
+        return time.time() < self._cooldown_until
+
+    def cooldown_remaining(self) -> int:
+        return max(0, int(self._cooldown_until - time.time() + 0.999))
+
+    def _trip(self, reason: str):
+        self._cooldown_until  = time.time() + self.COOLDOWN_SECS
+        self._cooldown_reason = reason
+        log.warning("%s paused for %ds: %s", self.LABEL, self.COOLDOWN_SECS, reason)
 
 
 # ─── Edge TTS endpoint workaround (rany2/edge-tts issue #490) ─────────────────
@@ -154,7 +180,7 @@ def _apply_edge_patch() -> bool:
         return True
 
 
-class EdgeTTSBackend(BaseTTSBackend):
+class EdgeTTSBackend(_CooldownMixin, BaseTTSBackend):
     """Microsoft Edge neural TTS — uses edge_tts Python API for WordBoundary timing.
     Falls back to CLI subprocess if the import is unavailable.
     generate_chunk_with_timing() returns (success, [(audio_secs, char_offset), ...]).
@@ -168,6 +194,7 @@ class EdgeTTSBackend(BaseTTSBackend):
         player uses this to fall back to an offline engine.
     """
 
+    LABEL         = "EdgeTTS"
     COOLDOWN_SECS = 120
     MAX_ATTEMPTS  = 2
     HARD_STATUSES = (401, 403, 429, 503)
@@ -176,17 +203,6 @@ class EdgeTTSBackend(BaseTTSBackend):
         self.last_error       = ""
         self._cooldown_until  = 0.0
         self._cooldown_reason = ""
-
-    def in_cooldown(self) -> bool:
-        return time.time() < self._cooldown_until
-
-    def cooldown_remaining(self) -> int:
-        return max(0, int(self._cooldown_until - time.time() + 0.999))
-
-    def _trip(self, reason: str):
-        self._cooldown_until  = time.time() + self.COOLDOWN_SECS
-        self._cooldown_reason = reason
-        log.warning("EdgeTTS paused for %ds: %s", self.COOLDOWN_SECS, reason)
 
     @staticmethod
     def _describe(exc: Exception) -> str:
@@ -299,6 +315,126 @@ class EdgeTTSBackend(BaseTTSBackend):
                 if attempt < self.MAX_ATTEMPTS:
                     time.sleep(1.0)
         return False, []
+
+
+# ─── Azure AI Speech (REST) ───────────────────────────────────────────────────
+# Official Azure text-to-speech over plain HTTPS — stdlib only, no SDK needed.
+# Credentials are never stored in config.json or the log:
+#   env   AZURE_SPEECH_KEY + AZURE_SPEECH_REGION      (win over the file)
+#   file  ~/.config/readaloud/azure.json  {"key": "...", "region": "eastus"}
+AZURE_CFG_PATH      = CONFIG_DIR / "azure.json"
+AZURE_OUTPUT_FORMAT = "audio-24khz-96kbitrate-mono-mp3"
+_AZURE_REGION_RE    = re.compile(r"^[a-z0-9]{3,32}$")
+_AZURE_VOICE_RE     = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+def azure_credentials() -> tuple:
+    """(key, region) from env vars, then azure.json. Either part is "" when
+    missing; a region that is not a plain identifier is treated as missing so
+    it can never be spliced into the request URL."""
+    key    = os.environ.get("AZURE_SPEECH_KEY", "").strip()
+    region = os.environ.get("AZURE_SPEECH_REGION", "").strip().lower()
+    if (not key or not region) and AZURE_CFG_PATH.exists():
+        try:
+            data   = json.loads(AZURE_CFG_PATH.read_text())
+            key    = key    or str(data.get("key", "")).strip()
+            region = region or str(data.get("region", "")).strip().lower()
+        except Exception as e:
+            log.warning("azure.json unreadable: %s", e)
+    if region and not _AZURE_REGION_RE.match(region):
+        log.warning("Azure region %r is not a plain region id (e.g. eastus) — ignored", region)
+        region = ""
+    return key, region
+
+
+class AzureTTSBackend(_CooldownMixin, BaseTTSBackend):
+    """Azure AI Speech neural TTS via the REST endpoint (SSML in, MP3 out).
+    The REST API has no word-boundary events, so highlighting uses the
+    duration-based sentence timing map like the offline engines.
+
+    Failure handling mirrors Edge TTS:
+      * last_error holds a short human-readable reason (never the key).
+      * HTTP 401/403/429 or a network error pause the backend for
+        COOLDOWN_SECS; the player then falls back to an offline engine.
+      * 5xx / empty audio are retried once; other 4xx fail immediately.
+    """
+    LABEL         = "AzureTTS"
+    MAX_ATTEMPTS  = 2
+    HARD_STATUSES = (401, 403, 429)
+    TIMEOUT       = 60
+
+    def __init__(self):
+        self.last_error = ""
+
+    @staticmethod
+    def _describe(code: int) -> str:
+        return {
+            400: "HTTP 400 — request rejected (bad voice name or text?)",
+            401: "HTTP 401 — key rejected (wrong key or region?)",
+            403: "HTTP 403 — forbidden (quota exhausted or resource disabled?)",
+            429: "HTTP 429 — rate limited by Azure",
+        }.get(code, f"HTTP {code} from Azure")
+
+    def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
+        self.last_error = ""
+        if self.in_cooldown():
+            self.last_error = (f"paused {self.cooldown_remaining()}s after: "
+                               f"{self._cooldown_reason}")
+            return False
+        key, region = azure_credentials()
+        if not key or not region:
+            self.last_error = ("no credentials — set AZURE_SPEECH_KEY and "
+                               "AZURE_SPEECH_REGION or fill azure.json")
+            return False
+        if not voice or not _AZURE_VOICE_RE.match(voice):
+            self.last_error = f"invalid voice name: {voice!r}"
+            return False
+
+        lang = "-".join(voice.split("-")[:2]) or "en-US"
+        ssml = (f"<speak version='1.0' xml:lang='{lang}'>"
+                f"<voice name='{voice}'>{_xml_escape(text)}</voice></speak>")
+        req = urllib.request.Request(
+            f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1",
+            data=ssml.encode("utf-8"), method="POST",
+            headers={"Ocp-Apim-Subscription-Key": key,
+                     "Content-Type": "application/ssml+xml",
+                     "X-Microsoft-OutputFormat": AZURE_OUTPUT_FORMAT,
+                     "User-Agent": "readaloud"})
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+                    audio = resp.read()
+                if not audio:
+                    raise ValueError("empty audio response")
+                with open(output_path, "wb") as f:
+                    f.write(audio)
+                return True
+            except urllib.error.HTTPError as e:
+                self.last_error = self._describe(e.code)
+                try:
+                    body = e.read().decode("utf-8", errors="replace").strip()[:160]
+                except Exception:
+                    body = ""
+                log.error("AzureTTS HTTP %s (attempt %d/%d) %s",
+                          e.code, attempt, self.MAX_ATTEMPTS, body)
+                if e.code in self.HARD_STATUSES:
+                    self._trip(self.last_error)
+                    return False
+                if e.code < 500:
+                    return False     # 400/415/... will not improve on retry
+            except OSError as e:     # URLError, timeouts, connection resets
+                self.last_error = f"network: {e}"[:160]
+                log.error("AzureTTS network error: %s", e)
+                self._trip(self.last_error)
+                return False
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e}"[:160]
+                log.error("AzureTTS error (attempt %d/%d): %s",
+                          attempt, self.MAX_ATTEMPTS, e)
+            if attempt < self.MAX_ATTEMPTS:
+                time.sleep(1.0)
+        return False
 
 
 class KokoroBackend(BaseTTSBackend):
@@ -497,6 +633,12 @@ ENGINE_META: Dict[str, Dict[str, str]] = {
         "note":  "Microsoft neural voices (needs internet)",
         "ext":   ".mp3",
     },
+    "azure": {
+        "label": "Azure TTS",
+        "type":  "online",
+        "note":  "Azure AI Speech (needs key + region — see README)",
+        "ext":   ".mp3",
+    },
     "kokoro": {
         "label": "Kokoro",
         "type":  "offline",
@@ -569,6 +711,10 @@ class SystemScanner:
             except ImportError:
                 pass
 
+        # azure — pure HTTPS, so "available" means credentials are configured
+        _akey, _aregion = azure_credentials()
+        status["azure"] = bool(_akey and _aregion)
+
         log.info("Scanner: %s", {k: v for k, v in status.items()})
         return status
 
@@ -580,6 +726,7 @@ class MasterPlaybackManager:
         self.availability = SystemScanner.scan()
         self._backends: Dict[str, BaseTTSBackend] = {
             "edge-tts": EdgeTTSBackend(),
+            "azure":    AzureTTSBackend(),
             "kokoro":   KokoroBackend(),
             "piper":    PiperBackend(),
             "f5-tts":   F5TTSBackend(),
@@ -596,10 +743,11 @@ class MasterPlaybackManager:
 
     def fallback_for(self, engine: str) -> Optional[tuple]:
         """Return (engine, voice_id) of an offline engine to use when `engine`
-        fails, or None.  Only edge-tts falls back (offline engines have nowhere
-        further to go).  Kokoro is preferred, then Piper if a model is present;
-        F5-TTS is never a fallback (too slow on CPU)."""
-        if engine != "edge-tts":
+        fails, or None.  Only online engines (Edge TTS, Azure TTS) fall back
+        (offline engines have nowhere further to go).  Kokoro is preferred,
+        then Piper if a model is present; F5-TTS is never a fallback (too slow
+        on CPU)."""
+        if ENGINE_META.get(engine, {}).get("type") != "online":
             return None
         for cand in ("kokoro", "piper"):
             if not self.is_available(cand):
@@ -609,10 +757,10 @@ class MasterPlaybackManager:
                 return cand, voices[0][3]
         return None
 
-    def edge_pause_remaining(self) -> int:
-        """Seconds left on the Edge TTS failure pause (0 = not paused)."""
-        be = self._backends.get("edge-tts")
-        return be.cooldown_remaining() if be else 0
+    def pause_remaining(self, engine: str) -> int:
+        """Seconds left on an online engine's failure pause (0 = not paused)."""
+        fn = getattr(self._backends.get(engine), "cooldown_remaining", None)
+        return fn() if fn else 0
 
     def synthesize(self, engine: str, text: str, voice: str,
                    speed: float, dest_path: str) -> bool:
@@ -867,6 +1015,7 @@ KOKORO_VOICES = [
 # Piper and F5 don't have static voice lists; they use model file names / ref.wav
 ENGINE_VOICES: Dict[str, list] = {
     "edge-tts": EDGE_VOICES,
+    "azure":    EDGE_VOICES,   # same neural voice catalogue
     "kokoro":   KOKORO_VOICES,
     "piper":    [],   # populated at runtime from MODELS_DIR
     "f5-tts":   [],   # single cloned voice from ref.wav
@@ -1055,12 +1204,7 @@ def _key_code(s: str) -> List[int]:
     return []
 
 
-def load_config():
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except Exception:
-            pass
+def _default_config() -> dict:
     return {
         "voice_index": 0,
         "speed_index": 2,
@@ -1074,9 +1218,32 @@ def load_config():
         "keybinds": {},
     }
 
+def load_config():
+    """Defaults overlaid with the saved config, so a hand-edited or older
+    config.json with missing keys can't raise KeyError later.  A corrupt file
+    is set aside as config.json.bad (so bookmarks aren't silently lost on the
+    next save) and defaults are used."""
+    cfg = _default_config()
+    if CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(CONFIG_PATH.read_text())
+            if not isinstance(loaded, dict):
+                raise ValueError("config root is not an object")
+            cfg.update(loaded)
+        except Exception as e:
+            log.warning("config.json unreadable (%s) — using defaults", e)
+            try:
+                os.replace(CONFIG_PATH, CONFIG_PATH.with_suffix(".json.bad"))
+            except OSError:
+                pass
+    return cfg
+
 def save_config(cfg):
+    """Atomic write (tmp + rename) so a crash mid-save can't truncate config."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    os.replace(tmp, CONFIG_PATH)
 
 def _kitty_font(seq: bytes):
     try:
@@ -1978,12 +2145,12 @@ class TUI:
 
     def _resolve_engine(self):
         """(engine, voice) actually used for synthesis right now.
-        Normally the configured pair; while Edge TTS is paused after a hard
+        Normally the configured pair; while an online engine is paused after a hard
         failure (403 / network) this is the offline fallback, so cache keys,
         preloading and the header all agree with what is really playing."""
         engine = self.cfg.get("engine", "edge-tts")
         voice  = current_voice_id(self.cfg)
-        if engine == "edge-tts" and self._mgr.edge_pause_remaining() > 0:
+        if self._mgr.pause_remaining(engine) > 0:
             fb = self._mgr.fallback_for(engine)
             if fb:
                 return fb
@@ -1997,7 +2164,7 @@ class TUI:
         note = ""
         if engine != cfg_engine:
             note = (f"{ENGINE_META[cfg_engine]['label']} paused "
-                    f"{self._mgr.edge_pause_remaining()}s after a failure — "
+                    f"{self._mgr.pause_remaining(cfg_engine)}s after a failure — "
                     f"using {ENGINE_META[engine]['label']}")
         log.info("play ch=%d engine=%s voice=%s speed=%s", self.ch_idx, engine, voice, speed)
 
@@ -2840,7 +3007,7 @@ class TUI:
         eng_avail = {k: v for k, v in self._mgr.availability.items()}
         cfg_engine = self.cfg.get('engine', 'edge-tts')
         engine, voice = self._resolve_engine()
-        pause  = self._mgr.edge_pause_remaining()
+        pause  = self._mgr.pause_remaining(cfg_engine)
         speed  = SPEEDS[self.cfg['speed_index']]
         pl_status = "  ".join(
             f"ch{self.ch_idx+1+i}:{self._preload.status(self.ch_idx+i, engine, voice, speed)}"
@@ -2854,7 +3021,7 @@ class TUI:
             f"  Player     : state={p.state}  chunk={p.chunk_idx}/{p.total_chunks}",
             f"  Playback   : est_pos={p.est_char_pos}  ch_len={p.chapter_len}  cps={p._chars_per_sec:.1f}",
             f"  Paused     : total_paused={p._paused_total:.1f}s",
-            f"  Engine     : {cfg_engine} → {engine}/{voice}  edge_pause={pause}s",
+            f"  Engine     : {cfg_engine} → {engine}/{voice}  pause={pause}s",
             f"  Availability: {eng_avail}",
             f"  Preload    : {pl_status or 'n/a'}",
             f"  Config     : speed={speed}×  "
@@ -3529,7 +3696,7 @@ def main():
     log.info("Available engines: %s", mgr.available_engines())
     if not mgr.available_engines():
         print("\033[1;31m✗ No TTS engine available.\033[0m  Install at least one "
-              "(edge-tts, kokoro/pykokoro, piper) in the readaloud venv — see README.")
+              "(edge-tts, azure, kokoro/pykokoro, piper) in the readaloud venv — see README.")
         sys.exit(1)
 
     # Ensure configured engine is actually available; fall back to edge-tts
