@@ -3388,7 +3388,11 @@ class TUI:
                     # Switch back to engine section
                     self._rp_section = "engine"; return True
                 if key in (curses.KEY_ENTER, 10, 13):
-                    if voices and self._voice_sel < len(voices) and voices[0][3] != "":
+                    # Unavailable engines (✗) can be browsed but not activated —
+                    # otherwise synthesis silently falls back to Edge TTS while
+                    # the header still claims the unavailable engine.
+                    if (voices and self._voice_sel < len(voices) and voices[0][3] != ""
+                            and self._mgr.is_available(eng_for_voices)):
                         was = self.player.state in ("playing","paused","loading","generating")
                         self.cfg["engine"]      = eng_for_voices
                         self.cfg["voice_index"] = self._voice_sel
