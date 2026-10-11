@@ -48,6 +48,112 @@ class BaseTTSBackend:
         raise NotImplementedError
 
 
+# ─── Edge TTS endpoint workaround (rany2/edge-tts issue #490) ─────────────────
+# Microsoft moved Edge's Read Aloud service from speech.platform.bing.com to
+# api.msedgeservices.com, so edge-tts 7.2.8 gets HTTP 403 on the handshake.
+# Until upstream ships a fix we patch the library's constants at runtime, in
+# memory only — nothing inside the venv is edited.  The patch only applies to
+# edge-tts <= EDGE_PATCH_MAX_VERSION; once you upgrade to a newer release
+# (presumably the upstream fix) it switches itself off so it can never
+# override the real solution.
+#   READALOUD_EDGE_PATCH=0      disable the patch
+#   READALOUD_EDGE_PATCH=force  apply it regardless of edge-tts version
+EDGE_NEW_BASE_URL   = "api.msedgeservices.com/tts/cognitiveservices"
+EDGE_NEW_CHROMIUM   = "155.0.4283.45"
+EDGE_FALLBACK_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+
+EDGE_PATCH_MAX_VERSION = (7, 2, 8)
+
+_edge_patched    = False
+_edge_patch_skip = False
+_edge_patch_lock = threading.Lock()
+
+
+def _edge_tts_version() -> tuple:
+    """Installed edge-tts version as a tuple, or () if it can't be determined."""
+    try:
+        from importlib.metadata import version
+        return tuple(int(p) for p in re.findall(r"\d+", version("edge-tts"))[:3])
+    except Exception:
+        return ()
+
+
+def _apply_edge_patch() -> bool:
+    """Point edge_tts at the new endpoint. Idempotent and thread-safe.
+    Patches every already-imported edge_tts submodule that bound the old
+    constants via `from .constants import ...` (e.g. edge_tts.communicate).
+    Returns True when the patch is active."""
+    global _edge_patched, _edge_patch_skip
+    mode = os.environ.get("READALOUD_EDGE_PATCH", "auto").strip().lower()
+    if mode in ("0", "off", "false", "no"):
+        return False
+    with _edge_patch_lock:
+        if _edge_patched:
+            return True
+        if _edge_patch_skip and mode != "force":
+            return False
+        try:
+            import edge_tts  # noqa: F401
+            import edge_tts.constants as _C
+        except ImportError:
+            return False
+        if mode != "force":
+            ver = _edge_tts_version()
+            if ver and ver > EDGE_PATCH_MAX_VERSION:
+                _edge_patch_skip = True
+                log.info("EdgeTTS endpoint patch skipped: edge-tts %s is newer than %s",
+                         ".".join(map(str, ver)), ".".join(map(str, EDGE_PATCH_MAX_VERSION)))
+                return False
+
+        token     = getattr(_C, "TRUSTED_CLIENT_TOKEN", EDGE_FALLBACK_TOKEN)
+        old_full  = str(getattr(_C, "CHROMIUM_FULL_VERSION", ""))
+        old_major = old_full.split(".")[0] if old_full else ""
+        new_major = EDGE_NEW_CHROMIUM.split(".")[0]
+
+        new_vals = {
+            "BASE_URL": EDGE_NEW_BASE_URL,
+            "WSS_URL": (f"wss://{EDGE_NEW_BASE_URL}/websocket/v1"
+                        f"?Ocp-Apim-Subscription-Key={token}"),
+            "VOICE_LIST": (f"https://{EDGE_NEW_BASE_URL}/voices/list"
+                           f"?Ocp-Apim-Subscription-Key={token}"),
+            "CHROMIUM_FULL_VERSION":  EDGE_NEW_CHROMIUM,
+            "CHROMIUM_MAJOR_VERSION": new_major,
+            "SEC_MS_GEC_VERSION":     f"1-{EDGE_NEW_CHROMIUM}",
+        }
+
+        patched_mods = 0
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None or not (mod_name == "edge_tts" or mod_name.startswith("edge_tts.")):
+                continue
+            touched = False
+            for attr, val in new_vals.items():
+                if hasattr(mod, attr):
+                    try:
+                        setattr(mod, attr, val)
+                        touched = True
+                    except Exception:
+                        pass
+            # Header dicts hold a User-Agent / sec-ch-ua with the old Chromium
+            # major version — rewrite in place (WSS_HEADERS is a copy of
+            # BASE_HEADERS, so each dict must be mutated separately).
+            if old_major and old_major != new_major:
+                for hname in ("BASE_HEADERS", "WSS_HEADERS", "VOICE_HEADERS"):
+                    hdrs = getattr(mod, hname, None)
+                    if isinstance(hdrs, dict):
+                        for hk, hv in list(hdrs.items()):
+                            if isinstance(hv, str):
+                                hdrs[hk] = (hv.replace(f"/{old_major}.0.0.0", f"/{new_major}.0.0.0")
+                                              .replace(f'v="{old_major}"', f'v="{new_major}"'))
+                        touched = True
+            if touched:
+                patched_mods += 1
+
+        _edge_patched = True
+        log.info("EdgeTTS endpoint patch applied (%d modules) -> %s, chromium %s",
+                 patched_mods, EDGE_NEW_BASE_URL, EDGE_NEW_CHROMIUM)
+        return True
+
+
 class EdgeTTSBackend(BaseTTSBackend):
     """Microsoft Edge neural TTS — uses edge_tts Python API for WordBoundary timing.
     Falls back to CLI subprocess if the import is unavailable.
@@ -86,7 +192,7 @@ class EdgeTTSBackend(BaseTTSBackend):
     def _describe(exc: Exception) -> str:
         status = getattr(exc, "status", None)
         if status in (401, 403):
-            return f"HTTP {status} — refused by Microsoft (IP blocked? try a VPN)"
+            return f"HTTP {status} — refused by Microsoft (endpoint/token changed or IP blocked)"
         if status == 429:
             return "HTTP 429 — rate limited by Microsoft"
         if status:
@@ -142,6 +248,9 @@ class EdgeTTSBackend(BaseTTSBackend):
         except ImportError:
             log.debug("edge_tts library not available, falling back to CLI")
             return self._generate_via_cli(text, voice, output_path)
+
+        # Redirect the library to Microsoft's new endpoint (issue #490).
+        _apply_edge_patch()
 
         # ── Library path: true word-level timing ─────────────────────────────
         timing_map: List[tuple] = []
@@ -531,20 +640,17 @@ def check_deps():
     try:
         import ebooklib  # noqa: F401
     except ImportError:
-        missing.append("ebooklib  →  pip install --break-system-packages ebooklib")
+        missing.append("ebooklib  →  ~/.local/share/readaloud/venv/bin/pip install ebooklib  (or re-run install.sh)")
     if not shutil.which("ffplay"):
         missing.append("ffplay    →  sudo pacman -S ffmpeg")
-    # edge-tts is the fallback — warn if neither pipx nor the module is present
+    # edge-tts is optional: the scanner greys the engine out when it is absent
+    # and the offline engines take over.  (This used to run `pipx run edge-tts`
+    # on every launch, which could block for up to 30s or hit the network.)
     try:
-        r = subprocess.run(["pipx", "run", "edge-tts", "--version"],
-                           capture_output=True, timeout=30)
-        if r.returncode != 0:
-            missing.append("edge-tts  →  pipx install edge-tts")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        try:
-            import edge_tts  # noqa: F401
-        except ImportError:
-            missing.append("edge-tts  →  pipx install edge-tts  (pacman -S python-pipx)")
+        import edge_tts  # noqa: F401
+    except ImportError:
+        if not shutil.which("edge-tts"):
+            log.warning("edge-tts not installed — Edge engine unavailable")
     if missing:
         print("\033[1;31m✗ Missing dependencies:\033[0m")
         for m in missing:
@@ -1146,6 +1252,25 @@ def _lookup_timing(timing_map: List[tuple], elapsed: float) -> int:
 
 # ─── Player ───────────────────────────────────────────────────────────────────
 
+def _kill_proc(proc):
+    """Terminate an ffplay process, even one frozen by SIGSTOP (a stopped
+    process never acts on SIGTERM until it is continued, so pausing and then
+    quitting / changing chapter used to leave orphaned ffplay processes)."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            try: proc.send_signal(signal.SIGCONT)
+            except Exception: pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        pass
+
+
 class Player:
     def __init__(self):
         self.state         = "idle"
@@ -1165,6 +1290,7 @@ class Player:
         self._pause_ts     = 0.0
         self._paused_total = 0.0
         self.on_done       = None
+        self._seeking      = False        # True while seek() swaps the ffplay process
         # Seek support: stored after synthesis so seek() can restart ffplay
         self._playlist_path: Optional[str] = None
         self._current_speed: float = 1.0
@@ -1310,9 +1436,15 @@ class Player:
                  "-af", ",".join(chain)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
-            while self._proc.poll() is None:
+            while True:
+                _p = self._proc
+                if _p.poll() is not None:
+                    # ffplay exited — unless seek() is swapping the process
+                    if self._seeking or self._proc is not _p:
+                        time.sleep(0.05); continue
+                    break
                 if self._stop_evt.is_set():
-                    self._proc.terminate(); break
+                    _kill_proc(_p); break
                 if self._pause_evt.is_set():
                     self._proc.send_signal(signal.SIGSTOP)
                     self.state = "paused"
@@ -1350,9 +1482,7 @@ class Player:
     def stop(self):
         self._stop_evt.set()
         self._pause_evt.clear()
-        if self._proc and self._proc.poll() is None:
-            try: self._proc.terminate()
-            except: pass
+        _kill_proc(self._proc)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self.state = "idle"
@@ -1367,40 +1497,35 @@ class Player:
         if not self._playlist_path or not os.path.exists(self._playlist_path):
             log.warning("seek: no playlist available")
             return
-        # Kill current ffplay without triggering on_done
-        was_paused = self._pause_evt.is_set()
-        self._pause_evt.clear()
-        self._stop_evt.set()
-        if self._proc and self._proc.poll() is None:
-            try: self._proc.terminate()
-            except: pass
-        # Small wait for the poll loop to exit — don't join the thread
-        time.sleep(0.15)
-        self._stop_evt.clear()
-        if was_paused:
-            self._pause_evt.clear()
-
-        self._paused_total  = 0.0
-        self.play_start_ts  = time.time() - target_secs   # clock appears to start at target
-        # Adjust est_char_pos immediately so highlight snaps to target sentence
-        self.est_char_pos   = min(
-            _lookup_timing(self._timing_map, target_secs),
-            self.chapter_len)
-        self.state = "playing"
-        log.info("seek: restarting ffplay at %.2fs", target_secs)
-
+        # Swap the ffplay process in place.  _seeking tells the playback loop
+        # the old process exiting is expected, so it neither ends the chapter,
+        # fires on_done, nor cleans up the playlist files we are about to reuse.
+        self._seeking = True
         try:
-            self._proc = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                 "-ss", f"{target_secs:.3f}",
-                 "-f", "concat", "-safe", "0", "-i", self._playlist_path,
-                 "-af", ",".join(self._afchain)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
-        except Exception as e:
-            self.state = "error"
-            self.error_msg = f"seek ffplay error: {e}"
-            log.error(self.error_msg)
+            self._pause_evt.clear()
+            _kill_proc(self._proc)
+            self._paused_total = 0.0
+            self.play_start_ts = time.time() - target_secs   # clock appears to start at target
+            # Adjust est_char_pos immediately so highlight snaps to target sentence
+            self.est_char_pos  = min(
+                _lookup_timing(self._timing_map, target_secs),
+                self.chapter_len)
+            self.state = "playing"
+            log.info("seek: restarting ffplay at %.2fs", target_secs)
+            try:
+                self._proc = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                     "-ss", f"{target_secs:.3f}",
+                     "-f", "concat", "-safe", "0", "-i", self._playlist_path,
+                     "-af", ",".join(self._afchain)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            except Exception as e:
+                self.state = "error"
+                self.error_msg = f"seek ffplay error: {e}"
+                log.error(self.error_msg)
+        finally:
+            self._seeking = False
 
     def play_cached(self, playlist: str, audio_dir: str,
                     chapter_len: int, speed: float,
@@ -1444,9 +1569,15 @@ class Player:
                  "-af", ",".join(chain)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
-            while self._proc.poll() is None:
+            while True:
+                _p = self._proc
+                if _p.poll() is not None:
+                    # ffplay exited — unless seek() is swapping the process
+                    if self._seeking or self._proc is not _p:
+                        time.sleep(0.05); continue
+                    break
                 if self._stop_evt.is_set():
-                    self._proc.terminate(); break
+                    _kill_proc(_p); break
                 if self._pause_evt.is_set():
                     self._proc.send_signal(signal.SIGSTOP)
                     self.state = "paused"
@@ -2058,7 +2189,6 @@ class TUI:
                 self._draw_rp_quotes(rpl, rpw, hh, ch)
 
         self._draw_footer(W, H, fh)
-        self._draw_float_btns(W, H, fh)
         if self._debug:
             self._draw_debug(H, W)
         self.scr.refresh()
@@ -2690,7 +2820,7 @@ class TUI:
         p      = self.player
         bms    = self.cfg["bookmarks"].get(self._bm_key, [])
         H2, W2 = self.scr.getmaxyx()
-        dh     = 17
+        dh     = min(18, max(6, H2 - 4))
         dy     = max(3, H2 - dh - 4)
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
@@ -2705,7 +2835,7 @@ class TUI:
         for r in range(1, dh-1):
             self._sa(dy+r, dx,      BOX["v"], self._cp("playing", bold=True))
             self._sa(dy+r, dx+dw-1, BOX["v"], self._cp("playing", bold=True))
-        self._sa(dy, dx+2, " DEBUG  (Bksp to close) ", self._cp("playing", bold=True))
+        self._sa(dy, dx+2, " DEBUG  (? or Bksp to close) ", self._cp("playing", bold=True))
 
         eng_avail = {k: v for k, v in self._mgr.availability.items()}
         cfg_engine = self.cfg.get('engine', 'edge-tts')
@@ -2813,10 +2943,19 @@ class TUI:
         if plain_up or plain_down:
             delta = -3 if plain_up else 3
             if self.rpanel and mx >= rpl:
-                bms   = self.cfg["bookmarks"].get(self._bm_key, [])
-                limit = max(0, (len(get_voices_for_engine(self.cfg.get("engine","edge-tts")))
-                                if self.rpanel=="voices" else len(bms)) - 1)
-                self.rp_sel = max(0, min(limit, self.rp_sel + delta))
+                if self.rpanel == "voices":
+                    if self._rp_section == "voice":
+                        nv = len(get_voices_for_engine(ENGINE_ORDER[self._engine_sel]))
+                        self._voice_sel = max(0, min(max(0, nv-1), self._voice_sel + delta))
+                    else:
+                        step = -1 if delta < 0 else 1
+                        self._engine_sel = max(0, min(len(ENGINE_ORDER)-1, self._engine_sel + step))
+                else:
+                    if self.rpanel == "quotes":
+                        n_items = len(self.cfg.get("quotes", {}).get(self._bm_key, []))
+                    else:
+                        n_items = len(self.cfg["bookmarks"].get(self._bm_key, []))
+                    self.rp_sel = max(0, min(max(0, n_items-1), self.rp_sel + delta))
             elif self.nav_visible and mx < nav_w:
                 self.ch_idx = max(0, min(len(self.chapters)-1, self.ch_idx + delta))
                 self._invalidate()
@@ -3368,9 +3507,9 @@ def pick_file(stdscr):
         except curses.error: pass
         stdscr.refresh()
         k = stdscr.getch()
-        if k == ord('q'): return None
+        if k in (ord('q'), 27): return None
         elif k == curses.KEY_UP:   sel = max(0, sel-1)
-        elif k == curses.KEY_DOWN: sel = min(len(elist)-1, sel+1)
+        elif k == curses.KEY_DOWN: sel = min(max(0, len(elist)-1), sel+1)
         elif k in (curses.KEY_ENTER, 10, 13) and elist:
             name, is_dir, path = elist[sel]
             if is_dir: cwd=path; elist=entries(cwd); sel=scroll=0
@@ -3380,12 +3519,18 @@ def pick_file(stdscr):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    # Esc is the quit key — without this curses waits ~1s after Esc for an escape sequence
+    os.environ.setdefault("ESCDELAY", "25")
     check_deps()
     cfg = load_config()
 
     # Initialise the backend manager early so scan happens before curses starts
     mgr = get_manager()
     log.info("Available engines: %s", mgr.available_engines())
+    if not mgr.available_engines():
+        print("\033[1;31m✗ No TTS engine available.\033[0m  Install at least one "
+              "(edge-tts, kokoro/pykokoro, piper) in the readaloud venv — see README.")
+        sys.exit(1)
 
     # Ensure configured engine is actually available; fall back to edge-tts
     if not mgr.is_available(cfg.get("engine", "edge-tts")):

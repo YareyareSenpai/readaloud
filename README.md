@@ -223,6 +223,7 @@ readaloud book.epub --debug # start with debug overlay
 | `Space` | Play / Pause |
 | `Enter` | Play selected chapter from start |
 | `n` / `p` | Next / previous chapter |
+| `[` / `]` | Skip back / forward one sentence |
 | `s` | Cycle speed (0.75× → 0.9 → 1.0 → 1.1 → 1.25 → 1.5 → 1.75 → 2.0×) |
 
 ### Navigation
@@ -233,6 +234,7 @@ readaloud book.epub --debug # start with debug overlay
 | `PgUp / PgDn` | Scroll text by page |
 | `Tab` | Cycle focus: chapters → text → right panel |
 | `g` | Go to chapter by number |
+| `f` | Search chapters by title |
 | `\` | Toggle chapter nav panel |
 
 ### Right Panels
@@ -242,7 +244,9 @@ readaloud book.epub --debug # start with debug overlay
 | `v` | Toggle voices panel |
 | `B` | Toggle bookmarks panel |
 | `b` | Add bookmark at current chapter |
-| `Esc` | Close right panel |
+| `Backspace` | Close right panel (or the debug overlay) |
+| `q` | Toggle quotes panel |
+| `c` | Save the current sentence as a quote (while playing) |
 | `↑ ↓` (panel focused) | Navigate engine list or voice list |
 | `Tab` / `→` (voices panel) | Switch from engine section to voice section |
 | `Tab` / `←` (voices panel) | Switch from voice section back to engine section |
@@ -267,7 +271,7 @@ readaloud book.epub --debug # start with debug overlay
 | Key | Action |
 |-----|--------|
 | `?` | Toggle debug overlay |
-| `q` | Quit |
+| `Esc` | Quit (asks for confirmation) |
 
 ---
 
@@ -410,14 +414,17 @@ Debug logs: `~/.config/readaloud/debug.log`
 
 **Edge TTS: `HTTP 403 — refused by Microsoft`**
 
-Microsoft rejects the WebSocket handshake for your IP. It is not a readaloud bug, not an outdated `edge-tts`, and not clock skew. Confirm by running the library directly:
+Since 10 Oct 2026 `edge-tts` 7.2.8 gets `403` on the WebSocket handshake for everyone, because Microsoft moved the service from `speech.platform.bing.com` to `api.msedgeservices.com` ([rany2/edge-tts#490](https://github.com/rany2/edge-tts/issues/490)). It is not your IP, clock, or a readaloud bug.
+
+readaloud ships a **temporary runtime workaround**: before the first Edge request it points the installed `edge_tts` library at the new endpoint and Chromium version, in memory only (nothing in the venv is modified). It only applies to `edge-tts` ≤ 7.2.8 — once you upgrade to a release newer than that (the upstream fix) it switches itself off.
+
 ```bash
-~/.local/share/readaloud/venv/bin/edge-tts --voice en-US-AriaNeural --text "test" --write-media /tmp/t.mp3
+READALOUD_EDGE_PATCH=0     readaloud book.epub   # disable the workaround
+READALOUD_EDGE_PATCH=force readaloud book.epub   # apply it regardless of version
+~/.local/share/readaloud/venv/bin/pip install -U edge-tts   # pick up the permanent fix when released
 ```
-If that also returns 403, the block is on your IP or ISP range (shared/CGNAT addresses are a common cause). Options:
-- Use a VPN — Edge TTS works as soon as the exit IP changes.
-- Use an offline engine (Kokoro is the best): press `v`, pick it, `Enter`. readaloud falls back to it automatically while Edge is paused.
-- After changing network or VPN, Edge is retried automatically once the ~2 minute pause expires.
+
+If Edge still fails, readaloud pauses it for ~2 minutes and falls back to Kokoro (or Piper) automatically; the header marks the fallback with `*`. The footer shows the real reason, and `~/.config/readaloud/debug.log` has the full traceback. If the same 403 appears on a plain `edge-tts` CLI run *and* the workaround is disabled, it is the upstream breakage above.
 
 **SSL error from edge-tts**
 ```bash
