@@ -36,7 +36,7 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 - **Auto-scroll** — reading area follows playback; three modes (off / creep / page), cycle with `z`
 - **Bookmarks** — add, browse, jump; stored per-file
 - **Text zoom** — `Ctrl+scroll` sends kitty OSC font-size sequences for real terminal zoom
-- **Variable speed** — 0.75× to 2.0× in 8 steps
+- **Variable speed** — 0.75× to 2.0× in 8 steps; changes apply live to the chapter that is playing (same spot, no re-synthesis)
 - **Text alignment** — left, centre, right
 - **Debug overlay** — live player state, engine availability, timing, config dump, log path
 - **Persistent config** — all settings, active engine, and bookmarks saved across sessions
@@ -263,7 +263,7 @@ readaloud book.epub --debug # start with debug overlay
 | `Enter` | Play selected chapter from start |
 | `n` / `p` | Next / previous chapter |
 | `[` / `]` | Skip back / forward one sentence |
-| `s` | Cycle speed (0.75× → 0.9 → 1.0 → 1.1 → 1.25 → 1.5 → 1.75 → 2.0×) |
+| `s` | Cycle speed (0.75× → 0.9 → 1.0 → 1.1 → 1.25 → 1.5 → 1.75 → 2.0×) — applies instantly, even mid-chapter or while paused |
 
 ### Navigation
 

@@ -1770,37 +1770,79 @@ class Player:
         self.est_char_pos = 0
         log.debug("player stopped")
 
-    def seek(self, target_secs: float):
-        """Restart ffplay at target_secs into the current playlist — no re-synthesis.
-        Uses the stored _playlist_path / _afchain from the most recent synthesis.
-        Falls back silently if no playlist is available.
-        """
+    def set_speed(self, new_speed: float) -> bool:
+        """Change the speed of the chapter that is already playing (or paused)
+        — no re-synthesis, no re-billing.  The playlist is already on disk, so
+        we only swap the atempo chain, rescale the timing map and restart
+        ffplay at the same spot in the audio.  Returns False when there is
+        nothing live to retime (still loading, idle, ...) so the caller can
+        fall back to a restart."""
+        if (self.state not in ("playing", "paused") or not self._playlist_path
+                or not os.path.exists(self._playlist_path)):
+            return False
+        old = self._current_speed
+        if new_speed == old:
+            return True
+        paused  = (self.state == "paused")
+        ref     = self._pause_ts if paused else time.time()
+        elapsed = max(0.0, ref - self.play_start_ts - self._paused_total)
+        raw_pos = elapsed * old                 # position inside the source audio
+        ratio   = old / new_speed
+        self._timing_map = [(t * ratio, c) for t, c in self._timing_map]
+        tempo, chain = new_speed, []
+        while tempo > 2.0:
+            chain.append("atempo=2.0"); tempo /= 2.0
+        chain.append(f"atempo={tempo:.3f}")
+        self._current_speed = new_speed
+        self._afchain       = chain
+        log.info("set_speed: %.2fx -> %.2fx at raw %.2fs (paused=%s)",
+                 old, new_speed, raw_pos, paused)
+        self.seek(raw_pos / new_speed, keep_paused=paused)
+        return True
+
+    def seek(self, target_secs: float, keep_paused: bool = False):
+        """Restart ffplay at target_secs of *playback* time — no re-synthesis.
+        ffplay's -ss seeks the raw (pre-atempo) input, so the position handed
+        to it is target_secs * speed.  If keep_paused and we are paused, the
+        new process is frozen (SIGSTOP) straight away and we stay paused;
+        otherwise a seek resumes playback.  Falls back silently if no playlist
+        is available."""
         if not self._playlist_path or not os.path.exists(self._playlist_path):
             log.warning("seek: no playlist available")
             return
+        paused = keep_paused and self.state == "paused"
         # Swap the ffplay process in place.  _seeking tells the playback loop
         # the old process exiting is expected, so it neither ends the chapter,
         # fires on_done, nor cleans up the playlist files we are about to reuse.
         self._seeking = True
         try:
-            self._pause_evt.clear()
+            now = time.time()
+            # The pause loop does `_paused_total += time.time() - _pause_ts`
+            # when it wakes; pointing _pause_ts at "now" keeps that ~0.
+            self._pause_ts = now
+            if not paused:
+                self._pause_evt.clear()
             _kill_proc(self._proc)
             self._paused_total = 0.0
-            self.play_start_ts = time.time() - target_secs   # clock appears to start at target
+            self.play_start_ts = now - target_secs   # clock appears to start at target
             # Adjust est_char_pos immediately so highlight snaps to target sentence
             self.est_char_pos  = min(
                 _lookup_timing(self._timing_map, target_secs),
                 self.chapter_len)
-            self.state = "playing"
-            log.info("seek: restarting ffplay at %.2fs", target_secs)
+            self.state = "paused" if paused else "playing"
+            raw_secs = target_secs * self._current_speed
+            log.info("seek: restarting ffplay at %.2fs playback (%.2fs source)",
+                     target_secs, raw_secs)
             try:
                 self._proc = subprocess.Popen(
                     ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                     "-ss", f"{target_secs:.3f}",
+                     "-ss", f"{raw_secs:.3f}",
                      "-f", "concat", "-safe", "0", "-i", self._playlist_path,
                      "-af", ",".join(self._afchain)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
+                if paused:
+                    self._proc.send_signal(signal.SIGSTOP)
             except Exception as e:
                 self.state = "error"
                 self.error_msg = f"seek ffplay error: {e}"
@@ -3379,8 +3421,11 @@ class TUI:
             was = self.player.state in ("playing","paused","loading","generating")
             self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
             save_config(self.cfg)
-            # cache is speed-independent — keep it (no re-synthesis / re-billing)
-            if was: self.player.stop(); self._play()
+            # Live retime: playing/paused audio is already synthesised, so just
+            # swap the atempo chain and keep the position (no re-synthesis, no
+            # re-billing).  Only a chapter still loading is restarted.
+            if not self.player.set_speed(SPEEDS[self.cfg["speed_index"]]):
+                if was: self.player.stop(); self._play()
             return
 
         # ── Navigation ─────────────────────────────────────────────────────────
