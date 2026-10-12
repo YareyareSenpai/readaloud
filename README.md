@@ -345,6 +345,8 @@ Switching engine or voice while audio is playing restarts playback from the curr
 
 Cycle with `t`. 256-colour terminals get full palette control; 8-colour terminals fall back to Terminal theme.
 
+The four non-Terminal themes paint the whole window with their background colour (no see-through gaps); `Terminal` leaves the background untouched so transparency and wallpapers still show.
+
 ---
 
 ## Available Voices

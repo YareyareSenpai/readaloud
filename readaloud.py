@@ -2279,6 +2279,18 @@ class TUI:
             fg, bg = pairs.get(name, (curses.COLOR_WHITE, -1))
             try: curses.init_pair(pidx, fg, bg)
             except curses.error: pass
+        # Paint the ENTIRE window with the theme background so empty cells
+        # (gaps, padding, footer, panel margins) match the text cells instead
+        # of showing the terminal's own background.  The Terminal theme (and
+        # any 8-colour fallback) keeps the default background so your
+        # kitty colours / transparency / wallpaper still show through.
+        try:
+            if use256:
+                self.scr.bkgd(" ", self._cp("normal"))
+            else:
+                self.scr.bkgd(" ", curses.color_pair(0))
+        except curses.error:
+            pass
         log.debug("colors set theme=%s use256=%s", tn, use256)
 
     def _cp(self, name, bold=False, dim=False):
