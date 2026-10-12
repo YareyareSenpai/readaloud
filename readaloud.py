@@ -3152,7 +3152,9 @@ class TUI:
             self._sa(dy+r, dx+dw-1, BOX["v"], self._cp("playing", bold=True))
         self._sa(dy, dx+2, " DEBUG  (? or Bksp to close) ", self._cp("playing", bold=True))
 
-        eng_avail = {k: v for k, v in self._mgr.availability.items()}
+        eng_avail = "  ".join(
+            f"{ENGINE_META[k]['label']} {'✓' if self._mgr.availability.get(k) else '✗'}"
+            for k in ENGINE_ORDER)
         cfg_engine = self.cfg.get('engine', 'edge-tts')
         engine, voice = self._resolve_engine()
         pause  = self._mgr.pause_remaining(cfg_engine)
@@ -3173,7 +3175,7 @@ class TUI:
             f"  Playback   : est_pos={p.est_char_pos}  ch_len={p.chapter_len}  cps={p._chars_per_sec:.1f}",
             f"  Paused     : total_paused={p._paused_total:.1f}s",
             f"  Engine     : {cfg_engine} → {engine}/{voice}  pause={pause}s",
-            f"  Availability: {eng_avail}",
+            f"  Engines    : {eng_avail}",
             f"  Preload    : {pl_status or 'n/a'}",
             f"  Azure quota: {az_dbg}",
             f"  Config     : speed={speed}×  "
