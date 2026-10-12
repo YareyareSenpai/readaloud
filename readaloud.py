@@ -347,6 +347,114 @@ def azure_credentials() -> tuple:
     return key, region
 
 
+# ─── Azure free-tier quota tracking ───────────────────────────────────────────
+# The F0 (free) Speech tier allows 500,000 neural characters per calendar month.
+# Azure's REST API does not report remaining quota, so readaloud keeps a local
+# counter of every character it sends (preload workers included) in
+# ~/.config/readaloud/azure_usage.json.  It resets when the UTC month changes
+# and drives the warning shown in the footer while Azure is the active engine.
+#   env   AZURE_SPEECH_QUOTA                     (wins over the file)
+#   file  azure.json  {"quota": 500000}          (0 disables the warning)
+AZURE_USAGE_PATH    = CONFIG_DIR / "azure_usage.json"
+AZURE_DEFAULT_QUOTA = 500_000
+AZURE_WARN_FRAC     = 0.80     # footer warning from here
+AZURE_CRIT_FRAC     = 0.95     # warning turns red from here
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _azure_quota_setting() -> int:
+    """Monthly character quota: env, then azure.json, else the free-tier default.
+    0 means "no limit" (paid tier) and disables the footer warning."""
+    raw = os.environ.get("AZURE_SPEECH_QUOTA", "").strip()
+    if not raw and AZURE_CFG_PATH.exists():
+        try:
+            val = json.loads(AZURE_CFG_PATH.read_text()).get("quota")
+            raw = "" if val is None else str(val).strip()
+        except Exception as e:
+            log.warning("azure.json unreadable for quota: %s", e)
+    if not raw:
+        return AZURE_DEFAULT_QUOTA
+    try:
+        return max(0, int(raw.replace(",", "").replace("_", "")))
+    except ValueError:
+        log.warning("Azure quota %r is not a number — using %d", raw, AZURE_DEFAULT_QUOTA)
+        return AZURE_DEFAULT_QUOTA
+
+
+def _next_month_label() -> str:
+    """'1 Nov' style label for the first day of the next UTC month."""
+    mon = time.gmtime().tm_mon          # 1..12 → next month's abbr is index mon % 12
+    return f"1 {_MONTH_ABBR[mon % 12]}"
+
+
+class AzureUsage:
+    """Thread-safe local counter of Azure characters used this (UTC) month."""
+
+    def __init__(self):
+        self._lock  = threading.Lock()
+        self.quota  = _azure_quota_setting()
+        self._month = self._this_month()
+        self._chars = 0
+        self._load()
+
+    @staticmethod
+    def _this_month() -> str:
+        return time.strftime("%Y-%m", time.gmtime())
+
+    def _roll(self):
+        m = self._this_month()
+        if m != self._month:
+            self._month, self._chars = m, 0
+
+    def _load(self):
+        try:
+            if AZURE_USAGE_PATH.exists():
+                data = json.loads(AZURE_USAGE_PATH.read_text())
+                if data.get("month") == self._month:
+                    self._chars = max(0, int(data.get("chars", 0)))
+        except Exception as e:
+            log.warning("azure_usage.json unreadable (%s) — counting from 0", e)
+
+    def _save(self):
+        try:
+            tmp = AZURE_USAGE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"month": self._month, "chars": self._chars}))
+            os.replace(tmp, AZURE_USAGE_PATH)
+        except OSError as e:
+            log.warning("azure_usage.json not saved: %s", e)
+
+    def add(self, n: int):
+        if n <= 0:
+            return
+        with self._lock:
+            self._roll()
+            before = self._chars
+            self._chars += n
+            self._save()
+            if self.quota and before < self.quota * AZURE_WARN_FRAC <= self._chars:
+                log.warning("Azure usage passed %d%% of quota: %d/%d chars",
+                            int(AZURE_WARN_FRAC * 100), self._chars, self.quota)
+
+    def snapshot(self) -> tuple:
+        """(chars_used_this_month, quota) — cheap, no disk access."""
+        with self._lock:
+            self._roll()
+            return self._chars, self.quota
+
+
+_azure_usage: Optional[AzureUsage] = None
+_azure_usage_lock = threading.Lock()
+
+
+def get_azure_usage() -> AzureUsage:
+    global _azure_usage
+    with _azure_usage_lock:
+        if _azure_usage is None:
+            _azure_usage = AzureUsage()
+        return _azure_usage
+
+
 class AzureTTSBackend(_CooldownMixin, BaseTTSBackend):
     """Azure AI Speech neural TTS via the REST endpoint (SSML in, MP3 out).
     The REST API has no word-boundary events, so highlighting uses the
@@ -409,6 +517,7 @@ class AzureTTSBackend(_CooldownMixin, BaseTTSBackend):
                     raise ValueError("empty audio response")
                 with open(output_path, "wb") as f:
                     f.write(audio)
+                get_azure_usage().add(len(text))     # billed characters (local counter)
                 return True
             except urllib.error.HTTPError as e:
                 self.last_error = self._describe(e.code)
@@ -470,6 +579,11 @@ class KokoroBackend(BaseTTSBackend):
     def generate_chunk(self, text: str, voice: str, speed: float, output_path: str) -> bool:
         import traceback as _tb
         self.last_error = ""
+        # Playback speed is applied by ffplay's atempo filter (and the timing
+        # map divides by it), so synthesise at 1.0 — applying `speed` here too
+        # played 1.5x at ~2.25x and skewed the highlight.  It also makes the
+        # audio speed-independent, so the preload cache can be shared.
+        speed = 1.0
 
         # 1. Native kokoro (Python <3.13)
         try:
@@ -1793,7 +1907,11 @@ class PreloadCache:
     Cache entries live on disk at CACHE_DIR/<key>/ and survive between
     engine/voice/speed changes only when the key still matches.
 
-    Key format:  {ch_idx}_{engine}_{voice}_{speed:.3f}
+    Key format:  {ch_idx}_{engine}_{voice}
+    Speed is NOT part of the key: no engine's audio depends on it (ffplay's
+    atempo applies it at playback), so changing speed reuses the cache — which
+    matters for Azure, where every re-synthesis is billed.  timing.json is
+    stored at 1.0x and divided by the playback speed when loaded.
     Each entry contains:
         chunk_NNNN.{ext}  — audio files
         playlist.txt      — ffplay concat playlist
@@ -1813,7 +1931,7 @@ class PreloadCache:
     def key(self, ch_idx: int, engine: str, voice: str, speed: float) -> str:
         safe_voice = re.sub(r'[^\w.-]', '_', voice)
         safe_eng   = re.sub(r'[^\w.-]', '_', engine)
-        return f"{ch_idx}_{safe_eng}_{safe_voice}_{speed:.3f}"
+        return f"{ch_idx}_{safe_eng}_{safe_voice}"     # `speed` kept for call-site compat
 
     def warm(self, ch_idx: int, engine: str, voice: str, speed: float) -> bool:
         """Return True if a complete cached entry exists for this chapter."""
@@ -1834,7 +1952,7 @@ class PreloadCache:
         if timing_file.exists():
             try:
                 raw = json.loads(timing_file.read_text())
-                timing_map = [tuple(x) for x in raw]
+                timing_map = [(x[0] / speed, x[1]) for x in raw]   # stored at 1.0x
             except Exception as e:
                 log.warning("preload: failed to read timing.json ch=%d: %s", ch_idx, e)
         return str(pl), timing_map
@@ -1966,13 +2084,14 @@ class PreloadCache:
                 backend = mgr._backends["edge-tts"]
                 ok, wb_events = backend.generate_chunk_with_timing(chunk, voice, speed, outfile)
                 if ok and wb_events:
+                    # timings kept at 1.0x; get_playlist() scales by speed
                     chunk_audio_start = sum(
-                        _audio_duration(audio_files[j]) / speed
+                        _audio_duration(audio_files[j])
                         for j in range(len(audio_files))
                     ) if audio_files else 0.0
                     for (t, c) in wb_events:
                         edge_wb_map.append((
-                            chunk_audio_start + t / speed,
+                            chunk_audio_start + t,
                             chunk_char_offsets[i] + c
                         ))
             else:
@@ -1993,7 +2112,7 @@ class PreloadCache:
         if is_edge and edge_wb_map:
             timing_map = [(0.0, 0)] + edge_wb_map
         else:
-            timing_map = _build_timing_map(chunks, audio_files, speed)
+            timing_map = _build_timing_map(chunks, audio_files, 1.0)
 
         # Write playlist using final paths (after rename)
         final_audio = [str(entry / Path(af).name) for af in audio_files]
@@ -2862,6 +2981,12 @@ class TUI:
         y = H - fh
         self._sa(y, 0, BOX["h"]*(W-1), self._cp("accent"))
 
+        # Azure quota warning rides on the footer's top border so it can never
+        # collide with the status / error / notice text or the key box below.
+        ql = self._quota_label(W)
+        if ql:
+            self._sa(y, 2, f" {ql[0]} ", ql[1])
+
         # Key bindings: 4 columns, readable labels, symmetric layout
         KEYS = [
             ("Space",    "play / pause"),   ("Enter",    "play chapter"),
@@ -2968,6 +3093,29 @@ class TUI:
             self._sa(by+3,        rx+btn_w-1, BOX["v"], self._cp("accent"))
             self._sa(by+4,        rx, BOX["bl"] + BOX["h"]*(btn_w-2) + BOX["br"], self._cp("accent"))
 
+    def _quota_label(self, W: int):
+        """(text, attr) for the footer quota warning, or None to stay hidden.
+        Shown only while Azure is the configured engine and the local monthly
+        counter is at or past AZURE_WARN_FRAC of the quota."""
+        if self.cfg.get("engine") != "azure":
+            return None
+        used, quota = get_azure_usage().snapshot()
+        if quota <= 0:
+            return None
+        frac = used / quota
+        if frac < AZURE_WARN_FRAC:
+            return None
+        if frac >= 1.0:
+            full  = f"✗ Azure quota reached: {used:,}/{quota:,} chars — resets {_next_month_label()} (UTC)"
+            short = "✗ Azure quota reached"
+            attr  = self._cp("err", bold=True)
+        else:
+            pct   = int(frac * 100)
+            full  = f"⚠ Azure quota {pct}%: {used:,}/{quota:,} chars this month"
+            short = f"⚠ Azure {pct}%"
+            attr  = self._cp("err" if frac >= AZURE_CRIT_FRAC else "playing", bold=True)
+        return (full if len(full) + 8 < W else short), attr
+
     # ── Floating prev/next ────────────────────────────────────────────────────
 
 #    def _draw_float_btns(self, W, H, fh):
@@ -2987,7 +3135,7 @@ class TUI:
         p      = self.player
         bms    = self.cfg["bookmarks"].get(self._bm_key, [])
         H2, W2 = self.scr.getmaxyx()
-        dh     = min(18, max(6, H2 - 4))
+        dh     = min(19, max(6, H2 - 4))
         dy     = max(3, H2 - dh - 4)
         dw     = min(80, W2 - 4)
         dx     = max(0, (W2 - dw) // 2)
@@ -3014,6 +3162,9 @@ class TUI:
             for i in range(1, PRELOAD_AHEAD+1)
             if self.ch_idx+i < len(self.chapters)
         )
+        _au, _aq = get_azure_usage().snapshot()
+        az_dbg = (f"{_au:,}/{_aq:,} chars ({_au * 100 // _aq}%)" if _aq
+                  else f"{_au:,} chars (no limit)")
         rows = [
             f"  File       : {self.filename}",
             f"  Chapter    : {self.ch_idx+1}/{len(self.chapters)}  scroll={self.view_scroll}  snake={self._snake_scroll}",
@@ -3024,6 +3175,7 @@ class TUI:
             f"  Engine     : {cfg_engine} → {engine}/{voice}  pause={pause}s",
             f"  Availability: {eng_avail}",
             f"  Preload    : {pl_status or 'n/a'}",
+            f"  Azure quota: {az_dbg}",
             f"  Config     : speed={speed}×  "
                            f"align={self.cfg.get('align')}  "
                            f"zoom={self.cfg.get('zoom')}  "
@@ -3225,7 +3377,7 @@ class TUI:
             was = self.player.state in ("playing","paused","loading","generating")
             self.cfg["speed_index"] = (self.cfg["speed_index"]+1) % len(SPEEDS)
             save_config(self.cfg)
-            self._preload.invalidate()
+            # cache is speed-independent — keep it (no re-synthesis / re-billing)
             if was: self.player.stop(); self._play()
             return
 

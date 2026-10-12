@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "readaloud"
 version = "1.1.0"
-description = "Terminal ebook reader with multi-backend neural TTS (Edge, Azure, Kokoro, Piper, F5-TTS)"
+description = "Terminal ebook reader with multi-backend neural TTS (Edge, Azure, Kokoro, Piper, F5)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["tts", "text-to-speech", "epub", "ebook", "terminal", "curses"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Environment :: Console :: Curses",
@@ -17,9 +16,8 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 
-# Core — always required.  Edge TTS (online) is included; Azure TTS needs no
-# extra package (stdlib HTTPS) — just AZURE_SPEECH_KEY / AZURE_SPEECH_REGION
-# or ~/.config/readaloud/azure.json.
+# Core — always required (Edge TTS and Azure TTS work with just these;
+# Azure needs only your own key + region, no extra package)
 dependencies = [
     "ebooklib>=0.18",
     "edge-tts>=7.2.8",
@@ -32,10 +30,9 @@ dependencies = [
 #   pipx install "readaloud[f5]"
 #   pipx install "readaloud[formats]"
 #   pipx install "readaloud[all]"
-# Kokoro resolves to the native `kokoro` package on Python <3.13 and to
-# `pykokoro` (same voices) on 3.13+.  Either needs the spaCy model once:
-#   python -m spacy download en_core_web_sm   (inside the readaloud venv)
 [project.optional-dependencies]
+# native kokoro caps at Python <3.13; pykokoro is the 3.13+ ONNX wrapper.
+# Kokoro also needs the spaCy model once:  python -m spacy download en_core_web_sm
 kokoro = [
     "kokoro>=0.9.4; python_version < '3.13'",
     "pykokoro; python_version >= '3.13'",
@@ -64,10 +61,6 @@ all = [
     "striprtf>=0.0.26",
     "markdown2>=2.4.0",
 ]
-
-[project.urls]
-Homepage = "https://github.com/YareyareSenpai/readaloud"
-Issues   = "https://github.com/YareyareSenpai/readaloud/issues"
 
 [project.scripts]
 readaloud = "readaloud:main"

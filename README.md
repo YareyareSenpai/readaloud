@@ -24,16 +24,16 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 
 ## Features
 
-- **Multi-backend TTS** — online (Edge TTS, Azure Speech) and offline (Kokoro, Piper, F5-TTS) engines; auto-detected at startup
-- **Automatic Edge fallback** — if Edge TTS is refused (HTTP 401/403/429) or unreachable, readaloud pauses it for about two minutes, switches to Kokoro (or Piper if a model is present), and shows the real reason in the footer; the header marks the fallback engine with `*` (e.g. `[Kokoro*]`)
-- **Azure Speech engine** — official Azure AI Speech REST API (stdlib only, no SDK); key + region via env vars or `azure.json`; shares Edge's pause-and-fallback logic, so a refused key, exhausted quota or dead network drops to Kokoro/Piper with the real reason in the footer
-- **12 Edge TTS voices** — US/GB/AU/CA English via Microsoft's neural API; 7 Kokoro voices included; Piper uses your own ONNX models; F5-TTS clones any voice from a reference WAV
+- **Multi-backend TTS** — online (Edge TTS, Azure TTS) and offline (Kokoro, Piper, F5-TTS) engines; auto-detected at startup
+- **Automatic online fallback** — if Edge TTS or Azure TTS is refused (HTTP 401/403/429) or unreachable, readaloud pauses that engine for about two minutes, switches to Kokoro (or Piper if a model is present), and shows the real reason in the footer; the header marks the fallback engine with `*` (e.g. `[Kokoro*]`)
+- **Azure quota warning** — while Azure TTS is active, the footer's top border warns at 80% (red at 95%, "quota reached" at 100%) of your monthly character quota; see [Azure TTS](#azure-tts-online-your-own-key)
+- **12 neural voices for Edge TTS and Azure TTS** — US/GB/AU/CA English via Microsoft's neural APIs; 7 Kokoro voices included; Piper uses your own ONNX models; F5-TTS clones any voice from a reference WAV
 - **Wide format support** — EPUB, TXT, PDF, DOCX, HTML, RTF, and Markdown; chapters parsed from structure (headings, spine, page groups) or split by content length
 - **Adaptive reading layout** — 3 scenarios auto-selected by panel visibility: single focused column (both panels open), two-column snake (one panel), three-column snake (both panels hidden)
 - **Rice-friendly** — `Terminal` theme uses your kitty/terminal colours as-is; 4 additional themes (Dark Navy, Gruvbox, Nord, Solarized Dark) for 256-colour terminals
 - **Tiling-friendly** — layout reflows on any resize; works in any window size ≥50×14
-- **Text highlight** — current sentence tracked in sync with playback; toggle on/off with `h`
-- **Auto-scroll** — reading area follows playback; toggle with `z`
+- **Text highlight** — current word (Edge TTS) or sentence (all other engines, Azure included) tracked in sync with playback; toggle on/off with `h`
+- **Auto-scroll** — reading area follows playback; three modes (off / creep / page), cycle with `z`
 - **Bookmarks** — add, browse, jump; stored per-file
 - **Text zoom** — `Ctrl+scroll` sends kitty OSC font-size sequences for real terminal zoom
 - **Variable speed** — 0.75× to 2.0× in 8 steps
@@ -48,7 +48,7 @@ Follows your terminal colour scheme out of the box. Tiling-friendly — resize t
 | Engine | Type | Quality | Notes |
 |--------|------|---------|-------|
 | **Edge TTS** | Online | ★★★★★ | Microsoft neural voices; no API key; needs internet |
-| **Azure TTS** | Online | ★★★★★ | Official Azure AI Speech neural voices; needs your own key + region; billed beyond the free tier |
+| **Azure TTS** | Online | ★★★★★ | Azure AI Speech neural voices; needs your own key + region; free tier is 500k chars/month |
 | **Kokoro** | Offline | ★★★★☆ | Fast, high-quality CPU inference; best offline choice |
 | **Piper** | Offline | ★★★☆☆ | Ultra-lightweight ONNX runtime; drop in `.onnx` model files |
 | **F5-TTS** | Offline | ★★★★★ | Flow-matching voice cloner; slow on CPU, GPU recommended |
@@ -65,7 +65,7 @@ Engines are auto-detected at startup. Only available engines appear as selectabl
 |---|---|---|
 | Python 3.10+ | Runtime | pre-installed on most distros |
 | `ffplay` | Audio playback (part of ffmpeg) | `sudo pacman -S ffmpeg` |
-| `pipx` | Only for Method 2 below and Edge's CLI fallback | `sudo pacman -S python-pipx` |
+| `pipx` | Method 2 install; Edge TTS CLI fallback | `sudo pacman -S python-pipx` |
 
 Everything else (Python packages, engine binaries) is handled automatically by `install.sh` inside an isolated venv. No `--break-system-packages` needed.
 
@@ -73,9 +73,9 @@ Everything else (Python packages, engine binaries) is handled automatically by `
 
 | Engine | What gets installed |
 |--------|---------------------|
-| **Edge TTS** | `edge-tts` package in venv, used through its Python API (`pipx run edge-tts` is only a fallback); the temporary endpoint workaround applies automatically — see Troubleshooting |
-| **Azure TTS** | nothing (stdlib HTTPS) — you supply a key + region, see below |
-| **Kokoro** | native `kokoro` on Python <3.13, otherwise `pykokoro` + `onnxruntime`; the spaCy `en_core_web_sm` model is downloaded by the installer; ONNX model weights (~800 MB) downloaded from HuggingFace on first use |
+| **Edge TTS** | `edge-tts` package in venv, used as a Python library (word-level highlight); `pipx run edge-tts` is only a CLI fallback |
+| **Azure TTS** | Nothing to install — plain HTTPS from the standard library; the installer drops an empty `azure.json` template (chmod 600) in `~/.config/readaloud/` |
+| **Kokoro** | native `kokoro` on Python <3.13, otherwise `pykokoro` + `onnxruntime`, plus the spaCy `en_core_web_sm` model, all in the venv; ONNX model weights (~800 MB) downloaded from HuggingFace on first use |
 | **Piper** | `piper-tts` in venv; binary symlinked to `~/.local/bin/piper` |
 | **F5-TTS** | `f5-tts` in venv (skipped gracefully if torch/CUDA missing); binary symlinked to `~/.local/bin/f5-tts_infer-cli` |
 
@@ -91,24 +91,39 @@ Everything else (Python packages, engine binaries) is handled automatically by `
 
 ### What you must provide manually (post-install)
 
+#### Azure TTS (online, your own key)
+
+Azure AI Speech needs a Speech resource of your own — nothing is shipped with readaloud. Put the key and region in `~/.config/readaloud/azure.json` (the installer creates an empty template) or in environment variables (these win over the file). Credentials are never written to `config.json`, the log, or the repo.
+
+```bash
+cat > ~/.config/readaloud/azure.json << 'EOF'
+{"key": "YOUR_KEY", "region": "eastus", "quota": 500000}
+EOF
+chmod 600 ~/.config/readaloud/azure.json
+
+# or, instead of the file:
+export AZURE_SPEECH_KEY="YOUR_KEY"
+export AZURE_SPEECH_REGION="eastus"
+```
+
+The region must be the plain id of your resource's region (e.g. `eastus`, `southafricanorth`). Azure shows as available in the voices panel once both values are set.
+
+**Quota warning.** The free (F0) tier allows 500,000 neural characters per month. Azure's REST API cannot report what is left, so readaloud counts every character it sends — including chapters pre-synthesised in the background — in `~/.config/readaloud/azure_usage.json`, and resets the counter when the UTC month changes. While Azure is the active engine, the footer's top border shows:
+
+| Usage | Footer |
+|-------|--------|
+| below 80% | nothing |
+| 80–94% | `⚠ Azure quota 82%: 410,000/500,000 chars this month` |
+| 95–99% | same text, in red |
+| 100%+ | `✗ Azure quota reached: … — resets 1 Nov (UTC)` |
+
+The counter is local: it cannot see usage from other apps or machines sharing the same key, and the warning is advisory — readaloud keeps trying Azure, and if Azure itself refuses (HTTP 401/403/429) it pauses the engine and falls back to an offline one. Set `"quota"` in `azure.json` (or `AZURE_SPEECH_QUOTA`) to match your tier; `0` turns the warning off (e.g. pay-as-you-go S0). Changing voice or engine clears the preload cache, so chapters are synthesised — and billed — again; changing speed does not, because speed is applied at playback.
+
+#### Offline engines
+
 **Kokoro** works out of the box after `install.sh`, but on first use it downloads ~800 MB of ONNX model weights from HuggingFace into `~/.cache/pykokoro/`. This happens automatically in the background — expect a 30–60 second delay before the first chapter starts playing. Subsequent chapters and sessions are instant.
 
 On **Python 3.13+** the installer uses `pykokoro` (pure-Python ONNX wrapper) instead of the native `kokoro` package. The voices and quality are identical. The `install.sh` handles the correct variant automatically.
-
-**Azure TTS** needs your own Azure AI Speech resource (a free tier exists — check Microsoft's current quota and pricing). Nothing extra is installed; give readaloud the key and the region id (e.g. `eastus`) either way:
-
-```bash
-# Option 1 — environment (wins over the file)
-set -gx AZURE_SPEECH_KEY    your-key      # fish
-set -gx AZURE_SPEECH_REGION eastus
-# export AZURE_SPEECH_KEY=your-key        # bash / zsh
-
-# Option 2 — file, kept out of config.json
-printf '{\n  "key": "YOUR_KEY",\n  "region": "eastus"\n}\n' > ~/.config/readaloud/azure.json
-chmod 600 ~/.config/readaloud/azure.json
-```
-
-Credentials are read at startup, so restart readaloud after adding them. The key is never written to `config.json` or `debug.log`. Azure is billed per character: readaloud pre-synthesises the next 2 chapters, and changing speed or voice re-synthesises them, so all of that counts against your quota. The REST API has no word-boundary events, so highlighting is sentence-level (like the offline engines).
 
 **Piper** requires model files — the binary alone is not enough:
 
@@ -152,7 +167,7 @@ The script auto-detects your distro (Arch / Debian / Fedora) and installs host p
 
 ### Method 2 — pipx (single-command, portable)
 
-Installs `readaloud` as a fully isolated pipx app with the core dependencies only (Edge TTS and Azure TTS; offline engines are opt-in extras):
+Installs `readaloud` as a fully isolated pipx app with the core set (Edge TTS + Azure TTS; the offline engines and format parsers are extras):
 
 ```bash
 pipx install .
@@ -161,11 +176,17 @@ pipx install .
 Install with specific offline engines or format parsers:
 
 ```bash
-pipx install ".[kokoro]"     # + Kokoro
+pipx install ".[kokoro]"     # + Kokoro (pykokoro on Python 3.13+)
 pipx install ".[piper]"      # + Piper
 pipx install ".[f5]"         # + F5-TTS (needs torch)
 pipx install ".[formats]"    # + PDF, DOCX, RTF, Markdown parsers
 pipx install ".[all]"        # everything
+```
+
+After installing the Kokoro extra with pipx, fetch the spaCy model once (`install.sh` does this for you):
+
+```bash
+"$(pipx environment --value PIPX_LOCAL_VENVS)/readaloud/bin/python" -m spacy download en_core_web_sm
 ```
 
 ### Method 3 — manual (no script)
@@ -345,10 +366,6 @@ Cycle with `t`. 256-colour terminals get full palette control; 8-colour terminal
 | Clara | CA | ♀ |
 | Liam | CA | ♂ |
 
-### Azure TTS (online)
-
-Uses the same neural voice list as Edge TTS (Aria, Jenny, Guy, Sonia, …); the voice name is sent to Azure as e.g. `en-US-AriaNeural`.
-
 ### Kokoro (offline)
 
 The 7 voices below are the curated default set shown in the voices panel. The full `pykokoro` library ships 54 voices — additional voices (e.g. `af_bella`, `af_sarah`, `am_echo`, `bm_daniel`, multilingual) can be used by editing `KOKORO_VOICES` in `readaloud.py` or selecting them via the voices panel once available.
@@ -418,19 +435,19 @@ Stored at `~/.config/readaloud/config.json`. Edited automatically on every setti
 
 Valid `engine` values: `"edge-tts"`, `"azure"`, `"kokoro"`, `"piper"`, `"f5-tts"`.
 
-Debug logs: `~/.config/readaloud/debug.log` (rotated at 1 MB; one backup, `debug.log.1`)
+Azure credentials and quota live in `azure.json` (see [Azure TTS](#azure-tts-online-your-own-key)); the monthly character counter is `azure_usage.json`. Neither is part of `config.json`.
 
-A missing key in `config.json` falls back to its default, and an unreadable file is set aside as `config.json.bad` instead of being overwritten, so bookmarks are not lost.
+Debug logs: `~/.config/readaloud/debug.log`
 
 ---
 
 ## How It Works
 
 1. **Parsing** — Format is detected by file extension and routed through `_EXT_PARSER`: `ebooklib` for EPUB (spine order, HTML-stripped); `pdfminer.six` for PDF (grouped by ~10 pages); `python-docx` for DOCX (split on Heading styles); built-in `HTMLParser` for HTML/HTM; `striprtf` for RTF; `markdown2` + HTML stripper for Markdown; plain text split by heading patterns or blank lines for TXT.
-2. **Engine scan** — at startup, `SystemScanner` checks for binary commands (`piper`, `f5-tts_infer-cli`, `ffplay`) and Python imports (`kokoro`, `piper`, `f5_tts`, `edge_tts`), plus whether Azure credentials are configured, to build an availability map. Unavailable engines are shown greyed out in the voices panel.
-3. **TTS** — chapter text is split into ≤4500-char chunks at sentence boundaries, each synthesised by the active backend: Edge TTS streams MP3 through the `edge_tts` library with word-boundary timing (`pipx run edge-tts` is only a fallback); Azure TTS POSTs SSML to its REST endpoint and receives MP3; Kokoro uses `pykokoro` (Python 3.13+) or native `kokoro` (<3.13) with a cached ONNX session — the pipeline is built once per voice/speed pair and reused across chunks; Piper pipes stdin to its binary with an ONNX model; F5-TTS calls `f5-tts_infer-cli` with `ref.wav`.
+2. **Engine scan** — at startup, `SystemScanner` checks for binary commands (`piper`, `f5-tts_infer-cli`, `ffplay`) and Python imports (`kokoro`, `piper`, `f5_tts`, `edge_tts`) to build an availability map. Azure counts as available once a key and region are configured. Unavailable engines are shown greyed out in the voices panel.
+3. **TTS** — chapter text is split into ≤4500-char chunks at sentence boundaries, each synthesised by the active backend: Edge TTS streams MP3 through the `edge_tts` library with word-boundary events (`pipx run edge-tts` is only a CLI fallback); Azure TTS posts SSML to the Speech REST endpoint and receives MP3; Kokoro uses `pykokoro` (Python 3.13+) or native `kokoro` (<3.13) with a cached ONNX session — the pipeline is built once per voice/speed pair and reused across chunks; Piper pipes stdin to its binary with an ONNX model; F5-TTS calls `f5-tts_infer-cli` with `ref.wav`.
 4. **Playback** — `ffplay` plays all chunks as a concat playlist with an `atempo` filter for speed control. Pause/resume via `SIGSTOP`/`SIGCONT` on the ffplay process. WAV and MP3 chunks are handled identically by the concat pipeline.
-5. **Highlight** — a background thread maps elapsed playback time to a character position via a timing map: Edge TTS supplies word-boundary events; every other engine uses the measured audio duration (`soundfile`, then `ffprobe`) distributed across sentences by word count. The position is found by binary search, so skip-sentence and seeking stay in sync.
+5. **Highlight** — a background thread tracks elapsed playback time against a timing map: Edge TTS word-boundary events when available, otherwise the real audio durations spread across sentences by word count (offline engines and Azure, which has no word events over REST). A 140 wpm estimate is only the last-resort fallback.
 
 ---
 
@@ -440,7 +457,9 @@ A missing key in `config.json` falls back to its default, and an unreadable file
 
 Since 10 Oct 2026 `edge-tts` 7.2.8 gets `403` on the WebSocket handshake for everyone, because Microsoft moved the service from `speech.platform.bing.com` to `api.msedgeservices.com` ([rany2/edge-tts#490](https://github.com/rany2/edge-tts/issues/490)). It is not your IP, clock, or a readaloud bug.
 
-readaloud ships a **temporary runtime workaround**: before the first Edge request it points the installed `edge_tts` library at the new endpoint and Chromium version, in memory only (nothing in the venv is modified). It only applies to `edge-tts` ≤ 7.2.8 — once you upgrade to a release newer than that (the upstream fix) it switches itself off. Issue #490 is still open and notes that the new endpoint also uses a different `Sec-MS-GEC` token format, so the workaround may stop working if Microsoft starts enforcing it — readaloud then falls back to Kokoro/Piper automatically, or you can switch to Azure TTS.
+readaloud ships a **temporary runtime workaround**: before the first Edge request it points the installed `edge_tts` library at the new endpoint and Chromium version, in memory only (nothing in the venv is modified). It only applies to `edge-tts` ≤ 7.2.8 — once you upgrade to a release newer than that (the upstream fix) it switches itself off.
+
+The workaround only moves the endpoint and bumps the Chromium version strings; it keeps the legacy client token and the legacy `Sec-MS-GEC` scheme. The upstream PR confirms both are still accepted on the new endpoint, so no new `Sec-MS-GEC` format is needed and the patch is not expected to break because of it.
 
 ```bash
 READALOUD_EDGE_PATCH=0     readaloud book.epub   # disable the workaround
@@ -450,13 +469,11 @@ READALOUD_EDGE_PATCH=force readaloud book.epub   # apply it regardless of versio
 
 If Edge still fails, readaloud pauses it for ~2 minutes and falls back to Kokoro (or Piper) automatically; the header marks the fallback with `*`. The footer shows the real reason, and `~/.config/readaloud/debug.log` has the full traceback. If the same 403 appears on a plain `edge-tts` CLI run *and* the workaround is disabled, it is the upstream breakage above.
 
-**Azure TTS shows `✗` in the voices panel**
+**Azure TTS shows ✗ or fails**
 
-Credentials were not found at startup. Check `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` (or `~/.config/readaloud/azure.json`) and restart. The region must be the plain id (`eastus`, `westeurope`), not a URL.
-
-**Azure TTS: `HTTP 401` / `HTTP 403` / `HTTP 429`**
-
-401 — wrong key, or the key belongs to a different region than the one configured. 403 — quota exhausted or the resource is disabled. 429 — rate limited. All three pause Azure for ~2 minutes and fall back to Kokoro (or Piper); the header marks the fallback with `*` and the footer shows the reason. `~/.config/readaloud/debug.log` has the response body (never the key).
+- `✗` in the voices panel means no key/region was found — check `~/.config/readaloud/azure.json` or `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION`. The region must be a plain id such as `eastus`.
+- `HTTP 401` — wrong key, or the key does not belong to that region. `HTTP 403` — quota exhausted or resource disabled. `HTTP 429` — rate limited. Each pauses Azure for ~2 minutes and falls back to an offline engine; the footer shows the reason.
+- Footer quota warning looks wrong — the counter is local. Compare with the Azure portal and edit `~/.config/readaloud/azure_usage.json` (`{"month": "2026-10", "chars": 123456}`), or delete it to start from 0.
 
 **SSL error from edge-tts**
 ```bash
@@ -517,7 +534,7 @@ ebook-convert book.epub book.txt
 
 ## Chapter Preloading
 
-readaloud pre-synthesises the next 2 chapters in background threads while the current one plays, so pressing `n` starts audio immediately with no loading delay. Pre-warmed chapters are marked with `⚡` in the chapter nav. The cache lives at `~/.config/readaloud/cache/` and is keyed by chapter, engine, voice, and speed — it invalidates automatically when any of those change. Entries older than 2 hours are cleaned up on startup.
+readaloud pre-synthesises the next 2 chapters in background threads while the current one plays, so pressing `n` starts audio immediately with no loading delay. Pre-warmed chapters are marked with `⚡` in the chapter nav. The cache lives at `~/.config/readaloud/cache/` and is keyed by chapter, engine, and voice — it invalidates automatically when any of those change. Speed is not part of the key (it is applied at playback), so changing it reuses the cache. Entries older than 2 hours are cleaned up on startup. Pre-synthesis counts toward the Azure quota like any other request.
 
 ---
 
