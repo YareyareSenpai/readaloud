@@ -461,7 +461,9 @@ Since 10 Oct 2026 `edge-tts` 7.2.8 gets `403` on the WebSocket handshake for eve
 
 readaloud ships a **temporary runtime workaround**: before the first Edge request it points the installed `edge_tts` library at the new endpoint and Chromium version, in memory only (nothing in the venv is modified). It only applies to `edge-tts` ≤ 7.2.8 — once you upgrade to a release newer than that (the upstream fix) it switches itself off.
 
-The workaround only moves the endpoint and bumps the Chromium version strings; it keeps the legacy client token and the legacy `Sec-MS-GEC` scheme. The upstream PR confirms both are still accepted on the new endpoint, so no new `Sec-MS-GEC` format is needed and the patch is not expected to break because of it.
+The workaround mirrors the upstream PR ([rany2/edge-tts#491](https://github.com/rany2/edge-tts/pull/491)) exactly: it only swaps the WebSocket URL to the new endpoint. The legacy client token (sent as `Ocp-Apim-Subscription-Key`), the legacy `Sec-MS-GEC` / `Sec-MS-GEC-Version` and the legacy headers are kept, because the PR confirms the new endpoint still accepts them.
+
+**`HTTP 429 — rate limited by Microsoft`** is a different failure: the new endpoint is reachable but is throttling you. readaloud retries once after a short backoff, then pauses Edge for ~2 minutes and falls back to Kokoro; online preloads run one chapter at a time to keep the request count low.
 
 ```bash
 READALOUD_EDGE_PATCH=0     readaloud book.epub   # disable the workaround

@@ -62,6 +62,20 @@ class _CooldownMixin:
     _cooldown_until  = 0.0
     _cooldown_reason = ""
 
+    # last_error is per *thread*: the live player thread and the preload
+    # workers share one backend object, and a worker that merely hit the
+    # cooldown used to overwrite the live thread's real failure reason
+    # ("paused 117s after: HTTP 429" instead of the actual error).
+    @property
+    def last_error(self) -> str:
+        tl = self.__dict__.get("_err_tl")
+        return getattr(tl, "value", "") if tl is not None else ""
+
+    @last_error.setter
+    def last_error(self, value: str):
+        tl = self.__dict__.setdefault("_err_tl", threading.local())
+        tl.value = value
+
     def in_cooldown(self) -> bool:
         return time.time() < self._cooldown_until
 
@@ -74,18 +88,21 @@ class _CooldownMixin:
         log.warning("%s paused for %ds: %s", self.LABEL, self.COOLDOWN_SECS, reason)
 
 
-# ─── Edge TTS endpoint workaround (rany2/edge-tts issue #490) ─────────────────
-# Microsoft moved Edge's Read Aloud service from speech.platform.bing.com to
+# ─── Edge TTS endpoint workaround (rany2/edge-tts issue #490 / PR #491) ───────
+# Microsoft moved Edge's Read Aloud synthesis from speech.platform.bing.com to
 # api.msedgeservices.com, so edge-tts 7.2.8 gets HTTP 403 on the handshake.
-# Until upstream ships a fix we patch the library's constants at runtime, in
-# memory only — nothing inside the venv is edited.  The patch only applies to
-# edge-tts <= EDGE_PATCH_MAX_VERSION; once you upgrade to a newer release
-# (presumably the upstream fix) it switches itself off so it can never
-# override the real solution.
+# Until upstream releases PR #491 we mirror exactly what that PR changes —
+# WSS_URL only — by patching the library's constant at runtime, in memory only
+# (nothing inside the venv is edited).  Everything else stays legacy on
+# purpose, as in the PR: the legacy token (sent as Ocp-Apim-Subscription-Key),
+# the legacy Sec-MS-GEC / Sec-MS-GEC-Version and the legacy User-Agent headers
+# are accepted by the new host, and VOICE_LIST still answers on the old one.
+# The patch only applies to edge-tts <= EDGE_PATCH_MAX_VERSION; once you
+# upgrade to a newer release (presumably the upstream fix) it switches itself
+# off so it can never override the real solution.
 #   READALOUD_EDGE_PATCH=0      disable the patch
 #   READALOUD_EDGE_PATCH=force  apply it regardless of edge-tts version
 EDGE_NEW_BASE_URL   = "api.msedgeservices.com/tts/cognitiveservices"
-EDGE_NEW_CHROMIUM   = "155.0.4283.45"
 EDGE_FALLBACK_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
 
 EDGE_PATCH_MAX_VERSION = (7, 2, 8)
@@ -131,52 +148,28 @@ def _apply_edge_patch() -> bool:
                          ".".join(map(str, ver)), ".".join(map(str, EDGE_PATCH_MAX_VERSION)))
                 return False
 
-        token     = getattr(_C, "TRUSTED_CLIENT_TOKEN", EDGE_FALLBACK_TOKEN)
-        old_full  = str(getattr(_C, "CHROMIUM_FULL_VERSION", ""))
-        old_major = old_full.split(".")[0] if old_full else ""
-        new_major = EDGE_NEW_CHROMIUM.split(".")[0]
+        token = getattr(_C, "TRUSTED_CLIENT_TOKEN", EDGE_FALLBACK_TOKEN)
+        # communicate.py appends &ConnectionId=..&Sec-MS-GEC=..&Sec-MS-GEC-Version=..
+        # to WSS_URL, so it must already end in a query string.
+        new_wss = (f"wss://{EDGE_NEW_BASE_URL}/websocket/v1"
+                   f"?Ocp-Apim-Subscription-Key={token}")
 
-        new_vals = {
-            "BASE_URL": EDGE_NEW_BASE_URL,
-            "WSS_URL": (f"wss://{EDGE_NEW_BASE_URL}/websocket/v1"
-                        f"?Ocp-Apim-Subscription-Key={token}"),
-            "VOICE_LIST": (f"https://{EDGE_NEW_BASE_URL}/voices/list"
-                           f"?Ocp-Apim-Subscription-Key={token}"),
-            "CHROMIUM_FULL_VERSION":  EDGE_NEW_CHROMIUM,
-            "CHROMIUM_MAJOR_VERSION": new_major,
-            "SEC_MS_GEC_VERSION":     f"1-{EDGE_NEW_CHROMIUM}",
-        }
-
+        # Patch every already-imported edge_tts module that bound the old
+        # constant via `from .constants import WSS_URL` (e.g. communicate).
         patched_mods = 0
         for mod_name, mod in list(sys.modules.items()):
             if mod is None or not (mod_name == "edge_tts" or mod_name.startswith("edge_tts.")):
                 continue
-            touched = False
-            for attr, val in new_vals.items():
-                if hasattr(mod, attr):
-                    try:
-                        setattr(mod, attr, val)
-                        touched = True
-                    except Exception:
-                        pass
-            # Header dicts hold a User-Agent / sec-ch-ua with the old Chromium
-            # major version — rewrite in place (WSS_HEADERS is a copy of
-            # BASE_HEADERS, so each dict must be mutated separately).
-            if old_major and old_major != new_major:
-                for hname in ("BASE_HEADERS", "WSS_HEADERS", "VOICE_HEADERS"):
-                    hdrs = getattr(mod, hname, None)
-                    if isinstance(hdrs, dict):
-                        for hk, hv in list(hdrs.items()):
-                            if isinstance(hv, str):
-                                hdrs[hk] = (hv.replace(f"/{old_major}.0.0.0", f"/{new_major}.0.0.0")
-                                              .replace(f'v="{old_major}"', f'v="{new_major}"'))
-                        touched = True
-            if touched:
-                patched_mods += 1
+            if hasattr(mod, "WSS_URL"):
+                try:
+                    setattr(mod, "WSS_URL", new_wss)
+                    patched_mods += 1
+                except Exception:
+                    pass
 
         _edge_patched = True
-        log.info("EdgeTTS endpoint patch applied (%d modules) -> %s, chromium %s",
-                 patched_mods, EDGE_NEW_BASE_URL, EDGE_NEW_CHROMIUM)
+        log.info("EdgeTTS endpoint patch applied (%d modules) -> %s",
+                 patched_mods, new_wss)
         return True
 
 
@@ -198,6 +191,7 @@ class EdgeTTSBackend(_CooldownMixin, BaseTTSBackend):
     COOLDOWN_SECS = 120
     MAX_ATTEMPTS  = 2
     HARD_STATUSES = (401, 403, 429, 503)
+    RATE_LIMIT_BACKOFF = 3.0     # seconds to wait before the one retry after a 429
 
     def __init__(self):
         self.last_error       = ""
@@ -299,6 +293,11 @@ class EdgeTTSBackend(_CooldownMixin, BaseTTSBackend):
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             timing_map.clear()
+            if attempt > 1 and self.in_cooldown():
+                # another thread tripped the pause while we were backing off
+                self.last_error = (f"paused {self.cooldown_remaining()}s after: "
+                                   f"{self._cooldown_reason}")
+                return False, []
             try:
                 asyncio.run(_stream())
                 log.debug("EdgeTTS WB: %d word events, %d chars", len(timing_map), len(text))
@@ -309,6 +308,11 @@ class EdgeTTSBackend(_CooldownMixin, BaseTTSBackend):
                           attempt, self.MAX_ATTEMPTS, self.last_error)
                 log.debug("EdgeTTS raw exception: %r", e)
                 status = getattr(e, "status", None)
+                if status == 429 and attempt < self.MAX_ATTEMPTS:
+                    # Often a momentary throttle — back off once before pausing
+                    # the whole engine for COOLDOWN_SECS.
+                    time.sleep(self.RATE_LIMIT_BACKOFF)
+                    continue
                 if status in self.HARD_STATUSES or isinstance(e, OSError):
                     self._trip(self.last_error)
                     return False, []
@@ -1963,6 +1967,10 @@ class PreloadCache:
     def __init__(self):
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._lock     = threading.Lock()
+        # Online engines (Edge / Azure) rate-limit parallel connections: the
+        # live chapter plus two preload workers made three simultaneous
+        # requests.  Preloads for online engines now run one chapter at a time.
+        self._online_lock = threading.Lock()
         self._workers: Dict[int, threading.Thread] = {}   # ch_idx → thread
         self._cancel:  Dict[int, threading.Event]  = {}   # ch_idx → stop event
         # Clean up stale cache entries from previous sessions on startup
@@ -2083,6 +2091,22 @@ class PreloadCache:
 
     def _synthesize(self, ch_idx: int, text: str, engine: str,
                     voice: str, speed: float, cancel: threading.Event):
+        """Serialise online-engine preloads (see _online_lock); offline
+        engines keep running in parallel."""
+        if ENGINE_META.get(engine, {}).get("type") != "online":
+            self._synthesize_impl(ch_idx, text, engine, voice, speed, cancel)
+            return
+        while not self._online_lock.acquire(timeout=0.5):
+            if cancel.is_set():
+                return
+        try:
+            if not cancel.is_set():
+                self._synthesize_impl(ch_idx, text, engine, voice, speed, cancel)
+        finally:
+            self._online_lock.release()
+
+    def _synthesize_impl(self, ch_idx: int, text: str, engine: str,
+                         voice: str, speed: float, cancel: threading.Event):
         mgr      = get_manager()
         is_edge  = (engine == "edge-tts")
         k        = self.key(ch_idx, engine, voice, speed)
@@ -2141,7 +2165,8 @@ class PreloadCache:
 
             if not ok or not os.path.exists(outfile):
                 shutil.rmtree(str(tmp_entry), ignore_errors=True)
-                log.warning("preload: ch=%d synthesis failed chunk %d", ch_idx, i)
+                log.warning("preload: ch=%d synthesis failed chunk %d (%s: %s)", ch_idx, i,
+                            engine, getattr(mgr._backends.get(engine), "last_error", ""))
                 return
             audio_files.append(outfile)
             log.debug("preload: ch=%d chunk %d/%d done", ch_idx, i+1, len(chunks))
