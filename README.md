@@ -73,7 +73,7 @@ Everything else (Python packages, engine binaries) is handled automatically by `
 
 | Engine | What gets installed |
 |--------|---------------------|
-| **Edge TTS** | `edge-tts` package in venv, used as a Python library (word-level highlight); `pipx run edge-tts` is only a CLI fallback |
+| **Edge TTS** | `edge-tts` package in venv (7.3.1 or newer carries the upstream 403 fix), used as a Python library (word-level highlight); `pipx run edge-tts` is only a CLI fallback |
 | **Azure TTS** | Nothing to install — plain HTTPS from the standard library; the installer drops an empty `azure.json` template (chmod 600) in `~/.config/readaloud/` |
 | **Kokoro** | native `kokoro` on Python <3.13, otherwise `pykokoro` + `onnxruntime`, plus the spaCy `en_core_web_sm` model, all in the venv; ONNX model weights (~800 MB) downloaded from HuggingFace on first use |
 | **Piper** | `piper-tts` in venv; binary symlinked to `~/.local/bin/piper` |
@@ -457,21 +457,32 @@ Debug logs: `~/.config/readaloud/debug.log`
 
 **Edge TTS: `HTTP 403 — refused by Microsoft`**
 
-Since 10 Oct 2026 `edge-tts` 7.2.8 gets `403` on the WebSocket handshake for everyone, because Microsoft moved the service from `speech.platform.bing.com` to `api.msedgeservices.com` ([rany2/edge-tts#490](https://github.com/rany2/edge-tts/issues/490)). It is not your IP, clock, or a readaloud bug.
+Between 10 and 13 Oct 2026 `edge-tts` 7.2.8 and older got `403` on the WebSocket handshake for everyone, because Microsoft changed the service's token scheme and moved it from `speech.platform.bing.com` to `api.msedgeservices.com` ([rany2/edge-tts#490](https://github.com/rany2/edge-tts/issues/490)). It is not your IP, clock, or a readaloud bug.
 
-readaloud ships a **temporary runtime workaround**: before the first Edge request it points the installed `edge_tts` library at the new endpoint and Chromium version, in memory only (nothing in the venv is modified). It only applies to `edge-tts` ≤ 7.2.8 — once you upgrade to a release newer than that (the upstream fix) it switches itself off.
-
-The workaround mirrors the upstream PR ([rany2/edge-tts#491](https://github.com/rany2/edge-tts/pull/491)) exactly: it only swaps the WebSocket URL to the new endpoint. The legacy client token (sent as `Ocp-Apim-Subscription-Key`), the legacy `Sec-MS-GEC` / `Sec-MS-GEC-Version` and the legacy headers are kept, because the PR confirms the new endpoint still accepts them.
-
-**`HTTP 429 — rate limited by Microsoft`** is a different failure: the new endpoint is reachable but is throttling you. readaloud retries once after a short backoff, then pauses Edge for ~2 minutes and falls back to Kokoro; online preloads run one chapter at a time to keep the request count low.
+**This is fixed upstream in `edge-tts` 7.3.1** (13 Oct 2026), which replaces the `Sec-MS-GEC` token generator (version prefix `2-`). Updating is the recommended fix:
 
 ```bash
-READALOUD_EDGE_PATCH=0     readaloud book.epub   # disable the workaround
-READALOUD_EDGE_PATCH=force readaloud book.epub   # apply it regardless of version
-~/.local/share/readaloud/venv/bin/pip install -U edge-tts   # pick up the permanent fix when released
+~/.local/share/readaloud/venv/bin/pip install -U edge-tts
+# pipx install: pipx upgrade readaloud  (or: pipx inject --force readaloud edge-tts)
+# sanity check — should write a non-empty mp3:
+~/.local/share/readaloud/venv/bin/edge-tts --no-progress --text "test" --write-media /tmp/t.mp3 && ls -l /tmp/t.mp3
 ```
 
-If Edge still fails, readaloud pauses it for ~2 minutes and falls back to Kokoro (or Piper) automatically; the header marks the fallback with `*`. The footer shows the real reason, and `~/.config/readaloud/debug.log` has the full traceback. If the same 403 appears on a plain `edge-tts` CLI run *and* the workaround is disabled, it is the upstream breakage above.
+readaloud still ships a **dormant runtime safety net** from the outage: before the first Edge request it can point the installed `edge_tts` library at the new endpoint, in memory only (nothing in the venv is modified). It only applies to `edge-tts` ≤ 7.2.8 (the pre-fix releases); on 7.3.1 or newer it switches itself off (the log shows `EdgeTTS endpoint patch skipped`), so it can never override the upstream fix. It is kept so that readaloud can still recover if Microsoft changes the endpoint again, or if you have to roll back to 7.2.8.
+
+On 7.2.8 the workaround mirrors the upstream PR ([rany2/edge-tts#491](https://github.com/rany2/edge-tts/pull/491)): it only swaps the WebSocket URL to the new endpoint. The legacy client token (sent as `Ocp-Apim-Subscription-Key`), the legacy `Sec-MS-GEC` / `Sec-MS-GEC-Version` and the legacy headers are kept, because the PR confirms the new endpoint still accepts them.
+
+**`HTTP 429 — rate limited by Microsoft`** is a different failure: the service is reachable but is throttling you. readaloud retries once after a short backoff, then pauses Edge for ~2 minutes and falls back to Kokoro; online preloads run one chapter at a time to keep the request count low.
+
+```bash
+READALOUD_EDGE_PATCH=0     readaloud book.epub   # disable the safety net
+READALOUD_EDGE_PATCH=force readaloud book.epub   # apply it regardless of version
+~/.local/share/readaloud/venv/bin/pip install edge-tts==7.2.8   # roll back (the safety net re-engages by itself)
+```
+
+`force` on 7.3.1+ combines the new host with the new v2 token, which is untested — only use it as a last resort.
+
+If Edge still fails, readaloud pauses it for ~2 minutes and falls back to Kokoro (or Piper) automatically; the header marks the fallback with `*`. The footer shows the real reason, and `~/.config/readaloud/debug.log` has the full traceback.
 
 **Azure TTS shows ✗ or fails**
 

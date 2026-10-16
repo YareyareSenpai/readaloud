@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "readaloud"
-version = "1.1.0"
+version = "1.1.1"
 description = "Terminal ebook reader with multi-backend neural TTS (Edge, Azure, Kokoro, Piper, F5)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,9 +18,10 @@ classifiers = [
 
 # Core — always required (Edge TTS and Azure TTS work with just these;
 # Azure needs only your own key + region, no extra package)
+# edge-tts>=7.3.1 carries the upstream fix for the Oct 2026 HTTP 403 outage.
 dependencies = [
     "ebooklib>=0.18",
-    "edge-tts>=7.2.8",
+    "edge-tts>=7.3.1",
     "soundfile>=0.12.0",
 ]
 
