@@ -88,22 +88,27 @@ class _CooldownMixin:
         log.warning("%s paused for %ds: %s", self.LABEL, self.COOLDOWN_SECS, reason)
 
 
-# ─── Edge TTS endpoint workaround (rany2/edge-tts issue #490 / PR #491) ───────
-# Microsoft moved Edge's Read Aloud synthesis from speech.platform.bing.com to
-# api.msedgeservices.com, so edge-tts 7.2.8 gets HTTP 403 on the handshake.
-# Until upstream releases PR #491 we mirror exactly what that PR changes —
-# WSS_URL only — by patching the library's constant at runtime, in memory only
-# (nothing inside the venv is edited).  Everything else stays legacy on
-# purpose, as in the PR: the legacy token (sent as Ocp-Apim-Subscription-Key),
-# the legacy Sec-MS-GEC / Sec-MS-GEC-Version and the legacy User-Agent headers
-# are accepted by the new host, and VOICE_LIST still answers on the old one.
-# The patch only applies to edge-tts <= EDGE_PATCH_MAX_VERSION; once you
-# upgrade to a newer release (presumably the upstream fix) it switches itself
-# off so it can never override the real solution.
+# ─── Edge TTS endpoint safety net (rany2/edge-tts issue #490 / PR #491) ───────
+# Background: on 10 Oct 2026 Microsoft changed Edge's Read Aloud service (new
+# host api.msedgeservices.com, new Sec-MS-GEC token scheme), so edge-tts <= 7.2.8
+# got HTTP 403 on the handshake.  Upstream fixed it in edge-tts 7.3.1 by
+# replacing the token generator (version prefix "2-"); updating is the
+# recommended fix and this patch is NOT needed on 7.3.1 or newer.
+#
+# It is kept as a dormant safety net for two cases: rolling back to 7.2.8, or
+# Microsoft moving the endpoint again.  On <= EDGE_PATCH_MAX_VERSION it mirrors
+# exactly what PR #491 changes — WSS_URL only — by patching the library's
+# constant at runtime, in memory only (nothing inside the venv is edited).
+# Everything else stays legacy on purpose, as in the PR: the legacy token (sent
+# as Ocp-Apim-Subscription-Key), the legacy Sec-MS-GEC / Sec-MS-GEC-Version and
+# the legacy User-Agent headers are accepted by the new host, and VOICE_LIST
+# still answers on the old one.
+# On any newer release it switches itself off so it can never override the
+# upstream fix (the log shows "EdgeTTS endpoint patch skipped").
 #   READALOUD_EDGE_PATCH=0      disable the patch
 #   READALOUD_EDGE_PATCH=force  apply it regardless of edge-tts version
-EDGE_NEW_BASE_URL   = "api.msedgeservices.com/tts/cognitiveservices"
-EDGE_FALLBACK_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+#                               (on 7.3.1+ this pairs the new host with the v2
+#                               token, which is untested — last resort only)
 
 EDGE_PATCH_MAX_VERSION = (7, 2, 8)
 
